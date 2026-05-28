@@ -1,0 +1,60 @@
+From 67bd95e0c3e94fec22abb6e6faa2463db76baf4f Mon Sep 17 00:00:00 2001
+From: Fijxu <fijxu@nadeko.net>
+Date: Mon, 24 Mar 2025 19:02:01 -0300
+Subject: [PATCH 1/4] feat: add resolution limit on DASH streams to save
+ bandwidth
+
+---
+ config/config.example.toml                  | 1 +
+ src/lib/helpers/config.ts                   | 3 +++
+ src/routes/invidious_routes/dashManifest.ts | 8 +++++++-
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/config/config.example.toml b/config/config.example.toml
+index 63a3e5b..1c83c7e 100644
+--- a/config/config.example.toml
++++ b/config/config.example.toml
+@@ -22,6 +22,7 @@
+ # verify_requests = false # env variable: SERVER_VERIFY_REQUESTS
+ # encrypt_query_params = false # env variable: SERVER_ENCRYPT_QUERY_PARAMS
+ # enable_metrics = false # env variable: SERVER_ENABLE_METRICS
++# max_dash_resolution = 1080
+  
+ # [cache]
+ # enabled = true # env variable: CACHE_ENABLED
+diff --git a/src/lib/helpers/config.ts b/src/lib/helpers/config.ts
+index 9bce2a9..53b00f7 100644
+--- a/src/lib/helpers/config.ts
++++ b/src/lib/helpers/config.ts
+@@ -54,6 +54,9 @@ export const ConfigSchema = z.object({
+         enable_metrics: z.boolean().default(
+             Deno.env.get("SERVER_ENABLE_METRICS") === "true" || false,
+         ),
++        max_dash_resolution: z.number().nullable().default(
++            Number(Deno.env.get("SERVER_MAX_DASH_RESOLUTION")) || null,
++        ),
+     }).strict().default({}),
+     cache: z.object({
+         enabled: z.boolean().default(
+diff --git a/src/routes/invidious_routes/dashManifest.ts b/src/routes/invidious_routes/dashManifest.ts
+index 95e86fb..a954bfc 100644
+--- a/src/routes/invidious_routes/dashManifest.ts
++++ b/src/routes/invidious_routes/dashManifest.ts
+@@ -72,7 +72,13 @@ dashManifest.get("/:videoId", async (c) => {
+         // video.js only support MP4 not WEBM
+         videoInfo.streaming_data.adaptive_formats = videoInfo
+             .streaming_data.adaptive_formats
+-            .filter((i) => i.mime_type.includes("mp4"));
++            .filter((i) =>
++                //@ts-ignore: 'i.height' is possibly 'undefined'.
++                i.mime_type.includes("mp4") && (i.height
++                    //@ts-ignore: 'config.server.max_dash_resolution' is possibly 'null'. Safe to ignore
++                    ? i.height <= config.server.max_dash_resolution
++                    : true)
++            );
+ 
+         const player_response = videoInfo.page[0];
+         // TODO: fix include storyboards in DASH manifest file
+-- 
+2.54.0
+

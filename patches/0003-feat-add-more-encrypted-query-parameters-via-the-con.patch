@@ -1,0 +1,126 @@
+From 042efea8c07748497c0e10f863a52b780f3859cc Mon Sep 17 00:00:00 2001
+From: Fijxu <fijxu@nadeko.net>
+Date: Tue, 29 Apr 2025 14:26:34 -0400
+Subject: [PATCH 3/4] feat: add more encrypted query parameters via the
+ configuration
+
+---
+ config/config.example.toml                   | 4 ++++
+ src/lib/helpers/config.ts                    | 4 ++++
+ src/routes/invidious_routes/dashManifest.ts  | 6 ++----
+ src/routes/invidious_routes/latestVersion.ts | 6 ++----
+ src/routes/videoPlaybackProxy.ts             | 8 ++++++--
+ 5 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/config/config.example.toml b/config/config.example.toml
+index afeabc2..5e82454 100644
+--- a/config/config.example.toml
++++ b/config/config.example.toml
+@@ -24,6 +24,10 @@
+ # enable_metrics = false # env variable: SERVER_ENABLE_METRICS
+ # max_dash_resolution = 1080
+ # disable_logs = false # env variable: SERVER_DISABLE_LOGS
++# # Query parameters to encrypt
++# # pot: potoken
++# # ip: the IP address from where the video was requested
++# encrypted_query_params = ["pot", "ip"]
+  
+ # [cache]
+ # enabled = true # env variable: CACHE_ENABLED
+diff --git a/src/lib/helpers/config.ts b/src/lib/helpers/config.ts
+index 152bdb1..525f4d2 100644
+--- a/src/lib/helpers/config.ts
++++ b/src/lib/helpers/config.ts
+@@ -51,6 +51,10 @@ export const ConfigSchema = z.object({
+         encrypt_query_params: z.boolean().default(
+             Deno.env.get("SERVER_ENCRYPT_QUERY_PARAMS") === "true" || false,
+         ),
++        encrypted_query_params: z.array(z.string()).default(
++            Deno.env.get("SERVER_ENCRYPTED_QUERY_PARAMS")?.split(",") ||
++                ["pot", "ip"],
++        ),
+         enable_metrics: z.boolean().default(
+             Deno.env.get("SERVER_ENABLE_METRICS") === "true" || false,
+         ),
+diff --git a/src/routes/invidious_routes/dashManifest.ts b/src/routes/invidious_routes/dashManifest.ts
+index a954bfc..483782f 100644
+--- a/src/routes/invidious_routes/dashManifest.ts
++++ b/src/routes/invidious_routes/dashManifest.ts
+@@ -10,8 +10,6 @@ import { encryptQuery } from "../../lib/helpers/encryptQuery.ts";
+ import { validateVideoId } from "../../lib/helpers/validateVideoId.ts";
+ import { TOKEN_MINTER_NOT_READY_MESSAGE } from "../../constants.ts";
+ 
+-const PRIVATE_PARAM_NAMES = ["pot", "ip"];
+-
+ const dashManifest = new Hono();
+ 
+ dashManifest.get("/:videoId", async (c) => {
+@@ -102,14 +100,14 @@ dashManifest.get("/:videoId", async (c) => {
+                         config.server.encrypt_query_params
+                     ) {
+                         const privateParams = [...queryParams].filter(([key]) =>
+-                            PRIVATE_PARAM_NAMES.includes(key)
++                            config.server.encrypted_query_params.includes(key)
+                         );
+                         const encryptedParams = encryptQuery(
+                             JSON.stringify(privateParams),
+                             config,
+                         );
+ 
+-                        for (const param of PRIVATE_PARAM_NAMES) {
++                        for (const param of config.server.encrypted_query_params) {
+                             queryParams.delete(param);
+                         }
+ 
+diff --git a/src/routes/invidious_routes/latestVersion.ts b/src/routes/invidious_routes/latestVersion.ts
+index 040887e..9101ae4 100644
+--- a/src/routes/invidious_routes/latestVersion.ts
++++ b/src/routes/invidious_routes/latestVersion.ts
+@@ -9,8 +9,6 @@ import { encryptQuery } from "../../lib/helpers/encryptQuery.ts";
+ import { validateVideoId } from "../../lib/helpers/validateVideoId.ts";
+ import { TOKEN_MINTER_NOT_READY_MESSAGE } from "../../constants.ts";
+ 
+-const PRIVATE_PARAM_NAMES = ["pot", "ip"];
+-
+ const latestVersion = new Hono();
+ 
+ latestVersion.get("/", async (c) => {
+@@ -96,14 +94,14 @@ latestVersion.get("/", async (c) => {
+             queryParams.set("host", itagUrlParsed.host);
+             if (config.server.encrypt_query_params) {
+                 const privateParams = [...queryParams].filter(([key]) =>
+-                    PRIVATE_PARAM_NAMES.includes(key)
++                    config.server.encrypted_query_params.includes(key)
+                 );
+                 const encryptedParams = encryptQuery(
+                     JSON.stringify(privateParams),
+                     config,
+                 );
+ 
+-                for (const param of PRIVATE_PARAM_NAMES) {
++                for (const param of config.server.encrypted_query_params) {
+                     queryParams.delete(param);
+                 }
+ 
+diff --git a/src/routes/videoPlaybackProxy.ts b/src/routes/videoPlaybackProxy.ts
+index f1ecf16..643226d 100644
+--- a/src/routes/videoPlaybackProxy.ts
++++ b/src/routes/videoPlaybackProxy.ts
+@@ -45,8 +45,12 @@ videoPlaybackProxy.get("/", async (c) => {
+         );
+         queryParams.delete("enc");
+         queryParams.delete("data");
+-        queryParams.set("pot", parsedDecryptedQueryParams.get("pot") as string);
+-        queryParams.set("ip", parsedDecryptedQueryParams.get("ip") as string);
++        for (const query of config.server.encrypted_query_params) {
++            queryParams.set(
++                query,
++                parsedDecryptedQueryParams.get(query) as string,
++            );
++        }
+     }
+ 
+     if (host == undefined || !/[\w-]+.googlevideo.com/.test(host)) {
+-- 
+2.54.0
+

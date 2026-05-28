@@ -1,0 +1,66 @@
+From 1f1e1c17fbb992e701f6424544da4a99dcbc2472 Mon Sep 17 00:00:00 2001
+From: Fijxu <fijxu@nadeko.net>
+Date: Tue, 8 Apr 2025 02:21:10 -0400
+Subject: [PATCH 2/4] add option to disable logging
+
+---
+ config/config.example.toml | 1 +
+ src/lib/helpers/config.ts  | 3 +++
+ src/routes/index.ts        | 8 +++++++-
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/config/config.example.toml b/config/config.example.toml
+index 1c83c7e..afeabc2 100644
+--- a/config/config.example.toml
++++ b/config/config.example.toml
+@@ -23,6 +23,7 @@
+ # encrypt_query_params = false # env variable: SERVER_ENCRYPT_QUERY_PARAMS
+ # enable_metrics = false # env variable: SERVER_ENABLE_METRICS
+ # max_dash_resolution = 1080
++# disable_logs = false # env variable: SERVER_DISABLE_LOGS
+  
+ # [cache]
+ # enabled = true # env variable: CACHE_ENABLED
+diff --git a/src/lib/helpers/config.ts b/src/lib/helpers/config.ts
+index 53b00f7..152bdb1 100644
+--- a/src/lib/helpers/config.ts
++++ b/src/lib/helpers/config.ts
+@@ -57,6 +57,9 @@ export const ConfigSchema = z.object({
+         max_dash_resolution: z.number().nullable().default(
+             Number(Deno.env.get("SERVER_MAX_DASH_RESOLUTION")) || null,
+         ),
++        disable_logs: z.boolean().default(
++            Deno.env.get("SERVER_DISABLE_LOGS") === "true" || false,
++        ),
+     }).strict().default({}),
+     cache: z.object({
+         enabled: z.boolean().default(
+diff --git a/src/routes/index.ts b/src/routes/index.ts
+index 84a2ad6..d53457d 100644
+--- a/src/routes/index.ts
++++ b/src/routes/index.ts
+@@ -12,6 +12,10 @@ import type { Config } from "../lib/helpers/config.ts";
+ import metrics from "./metrics.ts";
+ import health from "./health.ts";
+ 
++export const customLogger = () => {
++    return;
++};
++
+ export const companionRoutes = (
+     app: Hono,
+     config: Config,
+@@ -21,7 +25,9 @@ export const companionRoutes = (
+         console.log(message, ...rest);
+     };
+ 
+-    if (config.server.use_unix_socket) {
++    if (config.server.disable_logs) {
++        app.use("*", logger(customLogger));
++    } else if (config.server.use_unix_socket) {
+         app.use("*", logger(loggerUnixSocket));
+     } else {
+         app.use("*", logger());
+-- 
+2.54.0
+

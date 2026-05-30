@@ -1,0 +1,86 @@
+name: Check invidious-companion Submodule
+
+on:
+  schedule:
+    - cron: '19 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-invidious-companion-submodule
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Update invidious-companion submodule
+        id: update
+        shell: bash
+        run: |
+          before="$(git rev-parse HEAD:invidious-companion)"
+
+          git submodule update --remote -- invidious-companion
+
+          after="$(git -C invidious-companion rev-parse HEAD)"
+          {
+            echo "before=${before}"
+            echo "after=${after}"
+            if [[ "${before}" == "${after}" ]]; then
+              echo "changed=false"
+            else
+              echo "changed=true"
+            fi
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Verify patches still apply
+        id: verify
+        if: steps.update.outputs.changed == 'true'
+        shell: bash
+        run: |
+          after="${{ steps.update.outputs.after }}"
+
+          git -C invidious-companion config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C invidious-companion config user.name "github-actions[bot]"
+
+          if git -C invidious-companion am ../patches/*.patch; then
+            patches_apply=true
+          else
+            patches_apply=false
+            git -C invidious-companion am --abort || true
+          fi
+
+          git -C invidious-companion reset --hard "${after}"
+          echo "patches_apply=${patches_apply}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create bump pull request
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: automation/bump-invidious-companion
+          delete-branch: true
+          commit-message: 'chore: bump invidious-companion submodule'
+          title: 'chore: bump invidious-companion submodule'
+          body: |
+            This scheduled workflow found a newer upstream invidious-companion commit.
+
+            - Previous submodule commit: `${{ steps.update.outputs.before }}`
+            - New submodule commit: `${{ steps.update.outputs.after }}`
+            - Patch application check: `${{ steps.verify.outputs.patches_apply }}`
+
+            If the patch application check is `false`, the submodule pointer was still updated here so the patch conflict can be fixed in this PR.
+          add-paths: |
+            invidious-companion
+
+      - name: Fail when patches need attention
+        if: steps.verify.outputs.patches_apply == 'false'
+        run: exit 1

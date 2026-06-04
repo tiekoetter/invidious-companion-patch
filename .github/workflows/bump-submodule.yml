@@ -52,11 +52,13 @@ jobs:
           git -C invidious-companion config user.email "github-actions[bot]@users.noreply.github.com"
           git -C invidious-companion config user.name "github-actions[bot]"
 
-          if git -C invidious-companion am ../patches/*.patch; then
+          patch_dir="${GITHUB_WORKSPACE:-${PWD}}/patches"
+
+          if git -C invidious-companion am --3way "${patch_dir}"/*.patch; then
             patches_apply=true
           else
             patches_apply=false
-            git -C invidious-companion am --abort || true
+            git -C invidious-companion am --abort 2>/dev/null || true
           fi
 
           git -C invidious-companion reset --hard "${after}"
@@ -77,10 +79,15 @@ jobs:
             - New submodule commit: `${{ steps.update.outputs.after }}`
             - Patch application check: `${{ steps.verify.outputs.patches_apply }}`
 
+            The patch application check replays `patches/*.patch` onto the bumped submodule commit and is separate from whether this PR has merge conflicts with the base branch.
+
             If the patch application check is `false`, the submodule pointer was still updated here so the patch conflict can be fixed in this PR.
           add-paths: |
             invidious-companion
 
       - name: Fail when patches need attention
         if: steps.verify.outputs.patches_apply == 'false'
-        run: exit 1
+        shell: bash
+        run: |
+          echo "::error::The bump PR is mergeable, but one or more patches did not apply to the bumped invidious-companion checkout. See the 'Verify patches still apply' step for the git-am output."
+          exit 1

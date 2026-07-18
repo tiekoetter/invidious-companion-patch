@@ -1,7 +1,7 @@
 From 042efea8c07748497c0e10f863a52b780f3859cc Mon Sep 17 00:00:00 2001
 From: Fijxu <fijxu@nadeko.net>
 Date: Tue, 29 Apr 2025 14:26:34 -0400
-Subject: [PATCH 3/4] feat: add more encrypted query parameters via the
+Subject: [PATCH 3/3] feat: add more encrypted query parameters via the
  configuration
 
 ---
@@ -123,4 +123,3 @@ index f1ecf16..643226d 100644
      if (host == undefined || !/[\w-]+.googlevideo.com/.test(host)) {
 -- 
 2.54.0
-

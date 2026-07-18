@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  statuses: write
 
 concurrency:
   group: bump-invidious-companion-submodule
@@ -65,12 +66,15 @@ jobs:
           echo "patches_apply=${patches_apply}" >> "${GITHUB_OUTPUT}"
 
       - name: Create bump pull request
+        id: cpr
         if: steps.update.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           branch: automation/bump-invidious-companion
           delete-branch: true
           commit-message: 'chore: bump invidious-companion submodule'
+          committer: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
+          author: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
           title: 'chore: bump invidious-companion submodule'
           body: |
             This scheduled workflow found a newer upstream invidious-companion commit.
@@ -84,6 +88,31 @@ jobs:
             If the patch application check is `false`, the submodule pointer was still updated here so the patch conflict can be fixed in this PR.
           add-paths: |
             invidious-companion
+
+      - name: Report patch status on pull request
+        if: steps.update.outputs.changed == 'true' && steps.cpr.outputs.pull-request-head-sha != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.cpr.outputs.pull-request-head-sha }}
+          PATCHES_APPLY: ${{ steps.verify.outputs.patches_apply }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ "${PATCHES_APPLY}" == "true" ]]; then
+            state=success
+            description="All patches apply to the bumped submodule"
+          else
+            state=failure
+            description="One or more patches failed to apply"
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f "state=${state}" \
+            -f "context=Patch application check" \
+            -f "description=${description}" \
+            -f "target_url=${RUN_URL}"
 
       - name: Fail when patches need attention
         if: steps.verify.outputs.patches_apply == 'false'

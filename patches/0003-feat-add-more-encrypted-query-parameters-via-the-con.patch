@@ -1,19 +1,19 @@
-From 042efea8c07748497c0e10f863a52b780f3859cc Mon Sep 17 00:00:00 2001
+From d94119804fefc2c3f7552130e1cad2ca0e7a9718 Mon Sep 17 00:00:00 2001
 From: Fijxu <fijxu@nadeko.net>
 Date: Tue, 29 Apr 2025 14:26:34 -0400
-Subject: [PATCH 3/3] feat: add more encrypted query parameters via the
+Subject: [PATCH] feat: add more encrypted query parameters via the
  configuration
 
 ---
  config/config.example.toml                   | 4 ++++
  src/lib/helpers/config.ts                    | 4 ++++
- src/routes/invidious_routes/dashManifest.ts  | 6 ++----
+ src/routes/invidious_routes/dashManifest.ts  | 8 ++++----
  src/routes/invidious_routes/latestVersion.ts | 6 ++----
  src/routes/videoPlaybackProxy.ts             | 8 ++++++--
- 5 files changed, 18 insertions(+), 10 deletions(-)
+ 5 files changed, 20 insertions(+), 10 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
-index afeabc2..5e82454 100644
+index 3c82495..54579df 100644
 --- a/config/config.example.toml
 +++ b/config/config.example.toml
 @@ -24,6 +24,10 @@
@@ -28,7 +28,7 @@ index afeabc2..5e82454 100644
  # [cache]
  # enabled = true # env variable: CACHE_ENABLED
 diff --git a/src/lib/helpers/config.ts b/src/lib/helpers/config.ts
-index 152bdb1..525f4d2 100644
+index 4839bc1..96b53b1 100644
 --- a/src/lib/helpers/config.ts
 +++ b/src/lib/helpers/config.ts
 @@ -51,6 +51,10 @@ export const ConfigSchema = z.object({
@@ -43,7 +43,7 @@ index 152bdb1..525f4d2 100644
              Deno.env.get("SERVER_ENABLE_METRICS") === "true" || false,
          ),
 diff --git a/src/routes/invidious_routes/dashManifest.ts b/src/routes/invidious_routes/dashManifest.ts
-index a954bfc..483782f 100644
+index 2ecaa1a..3ac9401 100644
 --- a/src/routes/invidious_routes/dashManifest.ts
 +++ b/src/routes/invidious_routes/dashManifest.ts
 @@ -10,8 +10,6 @@ import { encryptQuery } from "../../lib/helpers/encryptQuery.ts";
@@ -55,7 +55,7 @@ index a954bfc..483782f 100644
  const dashManifest = new Hono();
  
  dashManifest.get("/:videoId", async (c) => {
-@@ -102,14 +100,14 @@ dashManifest.get("/:videoId", async (c) => {
+@@ -101,14 +99,16 @@ dashManifest.get("/:videoId", async (c) => {
                          config.server.encrypt_query_params
                      ) {
                          const privateParams = [...queryParams].filter(([key]) =>
@@ -68,7 +68,9 @@ index a954bfc..483782f 100644
                          );
  
 -                        for (const param of PRIVATE_PARAM_NAMES) {
-+                        for (const param of config.server.encrypted_query_params) {
++                        for (
++                            const param of config.server.encrypted_query_params
++                        ) {
                              queryParams.delete(param);
                          }
  
@@ -103,23 +105,23 @@ index 040887e..9101ae4 100644
                  }
  
 diff --git a/src/routes/videoPlaybackProxy.ts b/src/routes/videoPlaybackProxy.ts
-index f1ecf16..643226d 100644
+index 0126404..859cb94 100644
 --- a/src/routes/videoPlaybackProxy.ts
 +++ b/src/routes/videoPlaybackProxy.ts
-@@ -45,8 +45,12 @@ videoPlaybackProxy.get("/", async (c) => {
+@@ -44,8 +44,12 @@ videoPlaybackProxy.get("/", async (c) => {
          );
          queryParams.delete("enc");
          queryParams.delete("data");
 -        queryParams.set("pot", parsedDecryptedQueryParams.get("pot") as string);
 -        queryParams.set("ip", parsedDecryptedQueryParams.get("ip") as string);
 +        for (const query of config.server.encrypted_query_params) {
-+            queryParams.set(
-+                query,
-+                parsedDecryptedQueryParams.get(query) as string,
-+            );
++            const value = parsedDecryptedQueryParams.get(query);
++            if (value !== null) {
++                queryParams.set(query, value);
++            }
 +        }
      }
  
      if (host == undefined || !/[\w-]+.googlevideo.com/.test(host)) {
 -- 
-2.54.0
+2.55.0

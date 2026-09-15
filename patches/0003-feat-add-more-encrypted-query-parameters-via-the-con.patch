@@ -1,16 +1,16 @@
-From d94119804fefc2c3f7552130e1cad2ca0e7a9718 Mon Sep 17 00:00:00 2001
+From cef92acc029be577b65fd0747cc84c87a71462ee Mon Sep 17 00:00:00 2001
 From: Fijxu <fijxu@nadeko.net>
 Date: Tue, 29 Apr 2025 14:26:34 -0400
 Subject: [PATCH] feat: add more encrypted query parameters via the
  configuration
 
 ---
- config/config.example.toml                   | 4 ++++
- src/lib/helpers/config.ts                    | 4 ++++
- src/routes/invidious_routes/dashManifest.ts  | 8 ++++----
- src/routes/invidious_routes/latestVersion.ts | 6 ++----
- src/routes/videoPlaybackProxy.ts             | 8 ++++++--
- 5 files changed, 20 insertions(+), 10 deletions(-)
+ config/config.example.toml                   |  4 ++++
+ src/lib/helpers/config.ts                    |  4 ++++
+ src/routes/invidious_routes/dashManifest.ts  |  8 ++++----
+ src/routes/invidious_routes/latestVersion.ts |  6 ++----
+ src/routes/videoPlaybackProxy.ts             | 21 +++++++++++++++-----
+ 5 files changed, 30 insertions(+), 13 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
 index 3c82495..54579df 100644
@@ -105,11 +105,26 @@ index 040887e..9101ae4 100644
                  }
  
 diff --git a/src/routes/videoPlaybackProxy.ts b/src/routes/videoPlaybackProxy.ts
-index 0126404..859cb94 100644
+index 0126404..7008177 100644
 --- a/src/routes/videoPlaybackProxy.ts
 +++ b/src/routes/videoPlaybackProxy.ts
-@@ -44,8 +44,12 @@ videoPlaybackProxy.get("/", async (c) => {
-         );
+@@ -39,13 +39,24 @@ videoPlaybackProxy.get("/", async (c) => {
+     if (c.req.query("enc") === "true") {
+         const { data: encryptedQuery } = c.req.query();
+         const decryptedQueryParams = decryptQuery(encryptedQuery, config);
+-        const parsedDecryptedQueryParams = new URLSearchParams(
+-            JSON.parse(decryptedQueryParams),
+-        );
++        let parsedDecryptedQueryParams: URLSearchParams;
++        try {
++            parsedDecryptedQueryParams = new URLSearchParams(
++                JSON.parse(decryptedQueryParams),
++            );
++        } catch {
++            throw new HTTPException(400, {
++                res: new Response("Invalid encrypted playback URL."),
++            });
++        }
          queryParams.delete("enc");
          queryParams.delete("data");
 -        queryParams.set("pot", parsedDecryptedQueryParams.get("pot") as string);

@@ -1,0 +1,52 @@
+From 5d081aa3faf181c9555795448ec8abf18302ba71 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?L=C3=A9on=20Tiek=C3=B6tter?= <leon@tiekoetter.com>
+Date: Tue, 15 Sep 2026 22:17:06 +0200
+Subject: [PATCH] Reduce logs for successful player client fallbacks
+
+---
+ src/lib/helpers/youtubePlayerReq.ts | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/src/lib/helpers/youtubePlayerReq.ts b/src/lib/helpers/youtubePlayerReq.ts
+index e2272cd..fb782cc 100644
+--- a/src/lib/helpers/youtubePlayerReq.ts
++++ b/src/lib/helpers/youtubePlayerReq.ts
+@@ -70,19 +70,14 @@ export const youtubePlayerReq = async (
+         youtubePlayerResponse.data.streamingData.adaptiveFormats[0].url ===
+             undefined
+     ) {
+-        console.log(
+-            "[WARNING] No URLs found for adaptive formats. Falling back to other YT clients.",
+-        );
+         const innertubeClientsTypeFallback = [
+             "TV_SIMPLY",
+             "ANDROID_VR",
+             "MWEB",
+         ];
++        let fallbackSucceeded = false;
+ 
+         for await (const innertubeClientType of innertubeClientsTypeFallback) {
+-            console.log(
+-                `[WARNING] Trying fallback YT client ${innertubeClientType}`,
+-            );
+             const youtubePlayerResponseFallback = await callWatchEndpoint(
+                 videoId,
+                 innertubeClient,
+@@ -106,9 +101,15 @@ export const youtubePlayerReq = async (
+                 youtubePlayerResponse.data.streamingData.adaptiveFormats =
+                     youtubePlayerResponseFallback.data.streamingData
+                         .adaptiveFormats;
++                fallbackSucceeded = true;
+                 break;
+             }
+         }
++        if (!fallbackSucceeded) {
++            console.warn(
++                `[WARNING] No fallback YT client supplied usable adaptive formats for video: ${videoId}`,
++            );
++        }
+     }
+ 
+     return youtubePlayerResponse;
+-- 
+2.55.0

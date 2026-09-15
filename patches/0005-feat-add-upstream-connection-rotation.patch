@@ -1,0 +1,242 @@
+From 7a7d972f95cb9b77434bb98345f2e0b56b1425f4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?L=C3=A9on=20Tiek=C3=B6tter?= <leon@tiekoetter.com>
+Date: Tue, 15 Sep 2026 23:43:00 +0200
+Subject: [PATCH] feat: add upstream connection rotation
+
+Add an optional lifetime for reusable upstream HTTP clients. When the
+configured lifetime expires, new requests use a fresh client while
+responses already using the retired client are allowed to finish before
+it is closed.
+
+This also allows connection rotation without Companion's proxy or IPv6
+block settings, which is useful when source-address rotation is handled
+transparently by the host network.
+
+Set networking.connection_rotation_ms, or
+NETWORKING_CONNECTION_ROTATION_MS, to a positive number of milliseconds
+to enable rotation. The default of 0 preserves the existing behavior.
+---
+ config/config.example.toml        |   4 ++
+ src/lib/helpers/config.ts         |   3 +
+ src/lib/helpers/getFetchClient.ts | 132 ++++++++++++++++++++++++++------------
+ 3 files changed, 109 insertions(+), 30 deletions(-)
+
+diff --git a/config/config.example.toml b/config/config.example.toml
+index 54579df..cd7fbf2 100644
+--- a/config/config.example.toml
++++ b/config/config.example.toml
+@@ -38,6 +38,10 @@
+ # # This requires IPv6 setup: https://github.com/iv-org/invidious-companion/wiki/How-to-send-IPv6-requests-with-a-new-IPv6-address-for-each-request-on-a-server-with-a-whole-IPv6-range
+ # # Randomizes all bits after the block prefix (e.g., /32 randomizes bits 33-128)
+ # #ipv6_block = "2001:db8::/32" # env variable: NETWORKING_IPV6_BLOCK
++# # Maximum lifetime in milliseconds of a reusable upstream HTTP client.
++# # Existing responses are allowed to finish before the old client is closed.
++# # Set to 0 to disable connection rotation.
++# connection_rotation_ms = 0 # env variable: NETWORKING_CONNECTION_ROTATION_MS
+
+ # [networking.videoplayback]
+ # # Enable YouTube new video format UMP
+diff --git a/src/lib/helpers/config.ts b/src/lib/helpers/config.ts
+index 96b53b1..24c55db 100644
+--- a/src/lib/helpers/config.ts
++++ b/src/lib/helpers/config.ts
+@@ -75,6 +75,9 @@ export const ConfigSchema = z.object({
+         ipv6_block: z.string().nullable().default(
+             Deno.env.get("NETWORKING_IPV6_BLOCK") || null,
+         ),
++        connection_rotation_ms: z.number().int().nonnegative().default(
++            Number(Deno.env.get("NETWORKING_CONNECTION_ROTATION_MS")) || 0,
++        ),
+         fetch: z.object({
+             timeout_ms: z.number().default(
+                 Number(Deno.env.get("NETWORKING_FETCH_TIMEOUT_MS")) || 30_000,
+diff --git a/src/lib/helpers/getFetchClient.ts b/src/lib/helpers/getFetchClient.ts
+index bbf70ee..979e9f2 100644
+--- a/src/lib/helpers/getFetchClient.ts
++++ b/src/lib/helpers/getFetchClient.ts
+@@ -8,6 +8,13 @@ type FetchInitParameterWithClient =
+     | RequestInit & { client: Deno.HttpClient };
+ type FetchReturn = ReturnType<typeof fetch>;
+
++type ClientGeneration = {
++    client: Deno.HttpClient;
++    createdAt: number;
++    active: number;
++    retired: boolean;
++};
++
+ export const getFetchClient = (config: Config): {
+     (
+         input: FetchInputParameter,
+@@ -17,6 +24,7 @@ export const getFetchClient = (config: Config): {
+ } => {
+     const proxyAddress = config.networking.proxy;
+     const ipv6Block = config.networking.ipv6_block;
++    const connectionRotationMs = config.networking.connection_rotation_ms;
+
+     const fetchMaxAttempts = config.networking.fetch?.retry?.times;
+     const fetchInitialDebounce = config.networking.fetch?.retry
+@@ -31,13 +39,38 @@ export const getFetchClient = (config: Config): {
+         jitter: 0,
+     };
+
+-    // If proxy or IPv6 rotation is configured, create a custom HTTP client
++    const createReusableClient = (): ClientGeneration => {
++        const clientOptions: Deno.CreateHttpClientOptions = {};
++        if (proxyAddress) {
++            clientOptions.proxy = { url: proxyAddress };
++        }
++
++        return {
++            client: Deno.createHttpClient(clientOptions),
++            createdAt: Date.now(),
++            active: 0,
++            retired: false,
++        };
++    };
++
++    const releaseGeneration = (generation: ClientGeneration) => {
++        generation.active--;
++        if (generation.retired && generation.active === 0) {
++            generation.client.close();
++        }
++    };
++
++    // If proxy, IPv6 rotation, or connection rotation is configured, create a
++    // custom HTTP client.
+     // IPv6 rotation generates a unique localAddress for each request to help
+-    // avoid YouTube's "Please login" errors
+-    if (proxyAddress || ipv6Block) {
+-        // For proxy-only (no IPv6 rotation), reuse a single client
+-        const reusableClient = proxyAddress && !ipv6Block
+-            ? Deno.createHttpClient({ proxy: { url: proxyAddress } })
++    // avoid YouTube's "Please login" errors.
++    if (proxyAddress || ipv6Block || connectionRotationMs > 0) {
++        // Without Companion-managed IPv6 rotation, reuse an HTTP client.
++        // If connection rotation is enabled, this generation is periodically
++        // retired for new requests while active responses are allowed to drain.
++        let reusableClient = !ipv6Block &&
++                (proxyAddress || connectionRotationMs > 0)
++            ? createReusableClient()
+             : undefined;
+
+         return async (
+@@ -49,9 +79,25 @@ export const getFetchClient = (config: Config): {
+             init?: RequestInit,
+         ) => {
+             let client: Deno.HttpClient;
++            let generation: ClientGeneration | undefined;
+
+             if (reusableClient) {
+-                client = reusableClient;
++                if (
++                    connectionRotationMs > 0 &&
++                    Date.now() - reusableClient.createdAt >= connectionRotationMs
++                ) {
++                    const retiredClient = reusableClient;
++                    retiredClient.retired = true;
++                    reusableClient = createReusableClient();
++
++                    if (retiredClient.active === 0) {
++                        retiredClient.client.close();
++                    }
++                }
++
++                generation = reusableClient;
++                generation.active++;
++                client = generation.client;
+             } else {
+                 const clientOptions: Deno.CreateHttpClientOptions = {};
+                 if (proxyAddress) {
+@@ -65,25 +111,40 @@ export const getFetchClient = (config: Config): {
+                 client = Deno.createHttpClient(clientOptions);
+             }
+
+-            const fetchRes = await fetchShim(config, retryOptions, input, {
+-                client,
+-                headers: init?.headers,
+-                method: init?.method,
+-                body: init?.body,
+-            });
+-
+-            // If using a reusable client, return directly without closing
+-            if (reusableClient) {
+-                return new Response(fetchRes.body, {
+-                    status: fetchRes.status,
+-                    headers: fetchRes.headers,
++            let fetchRes: Response;
++            try {
++                fetchRes = await fetchShim(config, retryOptions, input, {
++                    client,
++                    headers: init?.headers,
++                    method: init?.method,
++                    body: init?.body,
+                 });
++            } catch (err) {
++                if (generation) {
++                    releaseGeneration(generation);
++                } else {
++                    client.close();
++                }
++                throw err;
+             }
+
+-            // For per-request clients (IPv6 rotation), close after body is consumed
+             const originalBody = fetchRes.body;
++            let released = false;
++            const release = () => {
++                if (released) {
++                    return;
++                }
++                released = true;
++
++                if (generation) {
++                    releaseGeneration(generation);
++                } else {
++                    client.close();
++                }
++            };
++
+             if (!originalBody) {
+-                client.close();
++                release();
+                 return new Response(null, {
+                     status: fetchRes.status,
+                     headers: fetchRes.headers,
+@@ -114,17 +160,25 @@ export const getFetchClient = (config: Config): {
+             const reader = originalBody.getReader();
+             const wrappedBody = new ReadableStream({
+                 async pull(controller) {
+-                    const { done, value } = await reader.read();
+-                    if (done) {
+-                        controller.close();
+-                        client.close();
+-                        return;
++                    try {
++                        const { done, value } = await reader.read();
++                        if (done) {
++                            controller.close();
++                            release();
++                            return;
++                        }
++                        controller.enqueue(value);
++                    } catch (err) {
++                        release();
++                        controller.error(err);
+                     }
+-                    controller.enqueue(value);
+                 },
+-                cancel() {
+-                    reader.cancel();
+-                    client.close();
++                async cancel(reason) {
++                    try {
++                        await reader.cancel(reason);
++                    } finally {
++                        release();
++                    }
+                 },
+             });
+
+-- 
+2.55.0

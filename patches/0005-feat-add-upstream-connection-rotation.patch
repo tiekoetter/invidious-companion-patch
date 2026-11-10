@@ -43,11 +43,17 @@ Avoid per-request deciphering-script compilation and its retained source
 allocations. Cache only the latest compiled player script, pass request
 values as data, and preserve fresh evaluation state and standalone context.
 Add tests for compilation reuse, source replacement, and decoding behavior.
+
+Honor YouTube.js 18.3 Player.decipher processor return values. Normalize the
+request-specific getNsigProcessorFn suffix using the library generator and
+existing parser, then compile only the stable source with runtime arguments.
+Test the actual Player.decipher API, n and signature results, changing
+processor inputs, bounded compilation reuse, and genuine extraction errors.
 ---
  config/config.example.toml                   |  12 +
  src/lib/helpers/config.ts                    |  11 +
  src/lib/helpers/getFetchClient.ts            | 274 +++++++++--
- src/lib/helpers/jsInterpreter.ts             |  31 +-
+ src/lib/helpers/jsInterpreter.ts             |  77 +++-
  src/lib/helpers/youtubePlayerHandling.ts     |  43 +-
  src/lib/helpers/youtubeSessionRecovery.ts    | 198 ++++++++
  src/lib/jobs/potoken.ts                      |  18 +-
@@ -59,9 +65,9 @@ Add tests for compilation reuse, source replacement, and decoding behavior.
  src/routes/videoPlaybackProxy.ts             | 198 ++++++--
  src/routes/youtube_api_routes/player.ts      |   5 +-
  src/tests/connectionRotation_test.ts         | 612 +++++++++++++++++++++++++
- src/tests/jsInterpreter_test.ts              | 101 +++++
+ src/tests/jsInterpreter_test.ts              | 214 +++++++++
  src/tests/youtubeSessionRecovery_test.ts     | 654 +++++++++++++++++++++++++++
- 17 files changed, 2129 insertions(+), 149 deletions(-)
+ 17 files changed, 2283 insertions(+), 154 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
 index 54579df..545f296 100644
@@ -454,56 +460,97 @@ index bbf70ee..422ae2d 100644
      // if retry enabled, call retry with the fetch shim, otherwise pass the fetch shim back directly
      return fetchRetry ? retry(callFetch, retryOptions) : callFetch();
 diff --git a/src/lib/helpers/jsInterpreter.ts b/src/lib/helpers/jsInterpreter.ts
-index 524ac3c..c70b81e 100644
+index 524ac3c..d6db01b 100644
 --- a/src/lib/helpers/jsInterpreter.ts
 +++ b/src/lib/helpers/jsInterpreter.ts
-@@ -1,22 +1,41 @@
+@@ -1,4 +1,46 @@
  import { Platform, Types } from "youtubei.js";
- 
-+type DecipherFunctions = {
-+    nFunction: (value: string) => Types.VMPrimative;
-+    sigFunction: (value: string) => Types.VMPrimative;
++import { getNsigProcessorFn } from "youtubei.js/Utils";
++import { parseScript } from "meriyah";
++
++type DecipherInput = {
++    n: string;
++    sp: string;
++    sig: string;
 +};
++
++function buildProcessor(): string {
++    const source = getNsigProcessorFn();
++    const statement = parseScript(source, {
++        globalReturn: true,
++        ranges: true,
++    }).body.at(-1);
++    if (
++        statement?.type !== "ReturnStatement" || !statement.range ||
++        statement.argument?.type !== "CallExpression" ||
++        statement.argument.callee.type !== "Identifier" ||
++        statement.argument.callee.name !== "process"
++    ) {
++        throw new Error("Unsupported YouTube.js decipher processor");
++    }
++    return source.slice(0, statement.range[0]) +
++        "return process(__companionDecipherInput.n, __companionDecipherInput.sp, __companionDecipherInput.sig);";
++}
++
++const processorBody = buildProcessor();
++const legacyBody = `const __companionDecipherResult = {};
++if (__companionDecipherInput.n) {
++    __companionDecipherResult.n = exportedVars.nFunction(__companionDecipherInput.n);
++}
++if (__companionDecipherInput.sig) {
++    __companionDecipherResult.sig = exportedVars.sigFunction(__companionDecipherInput.sig);
++}
++return __companionDecipherResult;`;
 +
 +let compiledInterpreter: {
 +    source: string;
-+    evaluate: () => DecipherFunctions;
++    processor: boolean;
++    evaluate: (input: DecipherInput) => Record<string, Types.VMPrimative>;
 +} | undefined;
-+
+ 
  // https://ytjs.dev/guide/getting-started.html#providing-a-custom-javascript-interpreter
  // deno-lint-ignore require-await
- export const jsInterpreter = Platform.shim.eval = async (
+@@ -6,17 +48,30 @@ export const jsInterpreter = Platform.shim.eval = async (
      data: Types.BuildScriptResult,
      env: Record<string, Types.VMPrimative>,
  ) => {
 -    const properties = [];
-+    if (compiledInterpreter?.source !== data.output) {
-+        compiledInterpreter = {
-+            source: data.output,
-+            evaluate: new Function(
-+                `${data.output}\nreturn exportedVars;`,
-+            ) as () => DecipherFunctions,
-+        };
-+    }
-+
-+    const { evaluate } = compiledInterpreter;
-+    const exportedVars = evaluate();
-+    const result: Record<string, Types.VMPrimative> = {};
- 
-     if (env.n) {
+-
+-    if (env.n) {
 -        properties.push(`n: exportedVars.nFunction("${env.n}")`);
-+        result.n = exportedVars.nFunction(String(env.n));
++    const input: DecipherInput = {
++        n: env.n ? String(env.n) : "",
++        sp: env.sp ? String(env.sp) : "",
++        sig: env.sig ? String(env.sig) : "",
++    };
++    const processor = getNsigProcessorFn(input.n, input.sp, input.sig);
++    const hasProcessor = data.output.endsWith(processor);
++    const source = hasProcessor
++        ? data.output.slice(0, -processor.length)
++        : data.output;
++    if (
++        compiledInterpreter?.source !== source ||
++        compiledInterpreter.processor !== hasProcessor
++    ) {
++        compiledInterpreter = {
++            source,
++            processor: hasProcessor,
++            evaluate: new Function(
++                "__companionDecipherInput",
++                `${source}\n${hasProcessor ? processorBody : legacyBody}`,
++            ) as (input: DecipherInput) => Record<string, Types.VMPrimative>,
++        };
      }
  
-     if (env.sig) {
+-    if (env.sig) {
 -        properties.push(`sig: exportedVars.sigFunction("${env.sig}")`);
-+        result.sig = exportedVars.sigFunction(String(env.sig));
-     }
- 
+-    }
+-
 -    const code = `${data.output}\nreturn { ${properties.join(", ")} }`;
 -
 -    return new Function(code)();
-+    return result;
++    const { evaluate } = compiledInterpreter;
++    return evaluate(input);
  };
 diff --git a/src/lib/helpers/youtubePlayerHandling.ts b/src/lib/helpers/youtubePlayerHandling.ts
 index 3c6df51..af7e84b 100644
@@ -2043,16 +2090,129 @@ index 0000000..f939f5b
 +});
 diff --git a/src/tests/jsInterpreter_test.ts b/src/tests/jsInterpreter_test.ts
 new file mode 100644
-index 0000000..3d3d27b
+index 0000000..e4a0d44
 --- /dev/null
 +++ b/src/tests/jsInterpreter_test.ts
-@@ -0,0 +1,101 @@
-+import { assertEquals } from "./deps.ts";
+@@ -0,0 +1,214 @@
++import { assertEquals, assertRejects } from "./deps.ts";
++import { Player } from "youtubei.js";
 +import { jsInterpreter } from "../lib/helpers/jsInterpreter.ts";
 +
 +function script(output: string): Parameters<typeof jsInterpreter>[0] {
 +    return { output } as Parameters<typeof jsInterpreter>[0];
 +}
++
++const playerScript = `class FixtureURL {
++    constructor(url, signatureParam, signature) {
++        this.params = new URL(url).searchParams;
++        this.signatureParam = signatureParam;
++        if (signatureParam) this.params.set(signatureParam, signature);
++    }
++    transform() {
++        const n = this.params.get("n");
++        if (n) this.params.set("n", "n:" + n);
++        if (this.signatureParam) {
++            this.params.set(this.signatureParam, "sig:" + this.params.get(this.signatureParam));
++        }
++    }
++    get(key) {
++        const value = this.params.get(key);
++        return value === null ? null : encodeURIComponent(value);
++    }
++}
++const exportedVars = {
++    nsigFunction: (url, signatureParam, signature) => new FixtureURL(url, signatureParam, signature),
++};`;
++
++Deno.test("interpreter supports the YouTube.js 18.3 Player.decipher contract", async () => {
++    const player = new Player("fixture", 0, script(playerScript));
++    const deciphered = new URL(
++        await player.decipher(
++            "https://rr1.googlevideo.com/videoplayback?n=example",
++        ),
++    );
++    assertEquals(deciphered.searchParams.get("n"), "n:example");
++});
++
++Deno.test("interpreter deciphers n and signatures through the real processor", async () => {
++    const player = new Player("fixture", 0, script(playerScript));
++    for (const n of [undefined, "example", 'quotes" backslash\\ newline\n']) {
++        const url = new URL("https://rr1.googlevideo.com/videoplayback");
++        if (n !== undefined) url.searchParams.set("n", n);
++        const signature = 'signature" with\\slashes';
++        const cipher = new URLSearchParams({
++            url: url.toString(),
++            s: signature,
++            sp: "lsig",
++        });
++        const deciphered = new URL(
++            await player.decipher(undefined, cipher.toString()),
++        );
++        assertEquals(
++            deciphered.searchParams.get("n"),
++            n === undefined ? null : `n:${n}`,
++        );
++        assertEquals(deciphered.searchParams.get("lsig"), `sig:${signature}`);
++    }
++});
++
++Deno.test("real processor arguments do not invalidate the compiled player cache", async () => {
++    const originalFunction = globalThis.Function;
++    let compilations = 0;
++    globalThis.Function = new Proxy(originalFunction, {
++        construct(target, args) {
++            compilations++;
++            return Reflect.construct(target, args);
++        },
++    });
++    try {
++        const source = `${playerScript}\n/* cache-reuse fixture */`;
++        const player = new Player("fixture", 0, script(source));
++        for (let index = 0; index < 1000; index++) {
++            const signatureParam = index % 2 ? "sig" : "lsig";
++            const cipher = new URLSearchParams({
++                url: `https://rr1.googlevideo.com/videoplayback?n=${index}`,
++                s: `signature-${index}`,
++                sp: signatureParam,
++            });
++            const deciphered = new URL(
++                await player.decipher(undefined, cipher.toString()),
++            );
++            assertEquals(deciphered.searchParams.get("n"), `n:${index}`);
++            assertEquals(
++                deciphered.searchParams.get(signatureParam),
++                `sig:signature-${index}`,
++            );
++        }
++        assertEquals(compilations, 1);
++        const replacement = new Player(
++            "replacement",
++            0,
++            script(`${source}\n/* replacement */`),
++        );
++        await replacement.decipher(
++            "https://rr1.googlevideo.com/videoplayback?n=next",
++        );
++        await player.decipher(
++            "https://rr1.googlevideo.com/videoplayback?n=again",
++        );
++        assertEquals(compilations, 3);
++    } finally {
++        globalThis.Function = originalFunction;
++    }
++});
++
++Deno.test("missing extracted nsig functions remain explicit decipher errors", async () => {
++    const player = new Player("fixture", 0, script("const exportedVars = {};"));
++    await assertRejects(
++        () =>
++            player.decipher(
++                "https://rr1.googlevideo.com/videoplayback?n=example",
++            ),
++        Error,
++        "No n/sig decipher function extracted",
++    );
++});
 +
 +Deno.test("interpreter compiles a shared script once across different request values", async () => {
 +    const originalFunction = globalThis.Function;

@@ -1,7 +1,7 @@
 From 7a7d972f95cb9b77434bb98345f2e0b56b1425f4 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?L=C3=A9on=20Tiek=C3=B6tter?= <leon@tiekoetter.com>
 Date: Tue, 15 Sep 2026 23:43:00 +0200
-Subject: [PATCH] feat: add upstream connection rotation
+Subject: [PATCH] feat: add upstream connection rotation and recovery
 
 Add an optional lifetime for reusable upstream HTTP clients. When the
 configured lifetime expires, new requests use a fresh client while
@@ -15,17 +15,28 @@ transparently by the host network.
 Set networking.connection_rotation_ms, or
 NETWORKING_CONNECTION_ROTATION_MS, to a positive number of milliseconds
 to enable rotation. The default of 0 preserves the existing behavior.
+
+Also add optional bounded recovery on fresh connections for upstream 403s
+and connection failures. Playback retains the downstream response and resumes
+failed video chunks from the next undelivered byte. Recovery is disabled by
+default; configure networking.connection_recovery_attempts and
+networking.connection_recovery_timeout_ms to enable it.
+
+Include cancellation, pool cleanup, range validation, and regression tests
+covering simulated failures and real HTTP connection replacement.
 ---
- config/config.example.toml        |   4 ++
- src/lib/helpers/config.ts         |   3 +
- src/lib/helpers/getFetchClient.ts | 132 ++++++++++++++++++++++++++------------
- 3 files changed, 109 insertions(+), 30 deletions(-)
+ config/config.example.toml           |   9 +
+ src/lib/helpers/config.ts            |  11 +
+ src/lib/helpers/getFetchClient.ts    | 252 ++++++++++++++---
+ src/routes/videoPlaybackProxy.ts     | 198 +++++++++----
+ src/tests/connectionRotation_test.ts | 533 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 914 insertions(+), 89 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
-index 54579df..cd7fbf2 100644
+index 54579df..b39a9a7 100644
 --- a/config/config.example.toml
 +++ b/config/config.example.toml
-@@ -38,6 +38,10 @@
+@@ -42,6 +42,15 @@
  # # This requires IPv6 setup: https://github.com/iv-org/invidious-companion/wiki/How-to-send-IPv6-requests-with-a-new-IPv6-address-for-each-request-on-a-server-with-a-whole-IPv6-range
  # # Randomizes all bits after the block prefix (e.g., /32 randomizes bits 33-128)
  # #ipv6_block = "2001:db8::/32" # env variable: NETWORKING_IPV6_BLOCK
@@ -33,53 +44,75 @@ index 54579df..cd7fbf2 100644
 +# # Existing responses are allowed to finish before the old client is closed.
 +# # Set to 0 to disable connection rotation.
 +# connection_rotation_ms = 0 # env variable: NETWORKING_CONNECTION_ROTATION_MS
-
++# # Extra attempts on fresh connections after validation/playback failures.
++# # Set to 0 to disable failure recovery. Healthy connections remain reusable.
++# connection_recovery_attempts = 0 # env variable: NETWORKING_CONNECTION_RECOVERY_ATTEMPTS
++# # Recovery window after the first failure, including the remaining video chunk.
++# connection_recovery_timeout_ms = 10000 # env variable: NETWORKING_CONNECTION_RECOVERY_TIMEOUT_MS
+ 
  # [networking.videoplayback]
  # # Enable YouTube new video format UMP
 diff --git a/src/lib/helpers/config.ts b/src/lib/helpers/config.ts
-index 96b53b1..24c55db 100644
+index 96b53b1..a4713b4 100644
 --- a/src/lib/helpers/config.ts
 +++ b/src/lib/helpers/config.ts
-@@ -75,6 +75,9 @@ export const ConfigSchema = z.object({
+@@ -78,6 +78,17 @@ export const ConfigSchema = z.object({
          ipv6_block: z.string().nullable().default(
              Deno.env.get("NETWORKING_IPV6_BLOCK") || null,
          ),
 +        connection_rotation_ms: z.number().int().nonnegative().default(
 +            Number(Deno.env.get("NETWORKING_CONNECTION_ROTATION_MS")) || 0,
 +        ),
++        connection_recovery_attempts: z.number().int().nonnegative().default(
++            Number(Deno.env.get("NETWORKING_CONNECTION_RECOVERY_ATTEMPTS")) ||
++                0,
++        ),
++        connection_recovery_timeout_ms: z.number().int().positive().default(
++            Number(Deno.env.get("NETWORKING_CONNECTION_RECOVERY_TIMEOUT_MS")) ||
++                10_000,
++        ),
          fetch: z.object({
              timeout_ms: z.number().default(
                  Number(Deno.env.get("NETWORKING_FETCH_TIMEOUT_MS")) || 30_000,
 diff --git a/src/lib/helpers/getFetchClient.ts b/src/lib/helpers/getFetchClient.ts
-index bbf70ee..979e9f2 100644
+index bbf70ee..c47fe54 100644
 --- a/src/lib/helpers/getFetchClient.ts
 +++ b/src/lib/helpers/getFetchClient.ts
-@@ -8,6 +8,13 @@ type FetchInitParameterWithClient =
+@@ -8,14 +8,28 @@ type FetchInitParameterWithClient =
      | RequestInit & { client: Deno.HttpClient };
  type FetchReturn = ReturnType<typeof fetch>;
-
+ 
+-export const getFetchClient = (config: Config): {
++export type RotatingFetchClient = {
+     (
+         input: FetchInputParameter,
+         init?: FetchInitParameterWithClient,
+     ): FetchReturn;
+-} => {
++    rotate(): void;
++    close(): void;
++};
++
 +type ClientGeneration = {
 +    client: Deno.HttpClient;
 +    createdAt: number;
 +    active: number;
 +    retired: boolean;
++    closed: boolean;
++    controller: AbortController;
 +};
 +
- export const getFetchClient = (config: Config): {
-     (
-         input: FetchInputParameter,
-@@ -17,6 +24,7 @@ export const getFetchClient = (config: Config): {
- } => {
++const createFetchClient = (config: Config): RotatingFetchClient => {
      const proxyAddress = config.networking.proxy;
      const ipv6Block = config.networking.ipv6_block;
 +    const connectionRotationMs = config.networking.connection_rotation_ms;
-
+ 
      const fetchMaxAttempts = config.networking.fetch?.retry?.times;
      const fetchInitialDebounce = config.networking.fetch?.retry
-@@ -31,13 +39,38 @@ export const getFetchClient = (config: Config): {
+@@ -29,23 +43,77 @@ export const getFetchClient = (config: Config): {
          jitter: 0,
      };
-
+ 
 -    // If proxy or IPv6 rotation is configured, create a custom HTTP client
 +    const createReusableClient = (): ClientGeneration => {
 +        const clientOptions: Deno.CreateHttpClientOptions = {};
@@ -92,13 +125,22 @@ index bbf70ee..979e9f2 100644
 +            createdAt: Date.now(),
 +            active: 0,
 +            retired: false,
++            closed: false,
++            controller: new AbortController(),
 +        };
++    };
++
++    const closeGeneration = (generation: ClientGeneration) => {
++        if (!generation.closed) {
++            generation.closed = true;
++            generation.client.close();
++        }
 +    };
 +
 +    const releaseGeneration = (generation: ClientGeneration) => {
 +        generation.active--;
 +        if (generation.retired && generation.active === 0) {
-+            generation.client.close();
++            closeGeneration(generation);
 +        }
 +    };
 +
@@ -111,34 +153,39 @@ index bbf70ee..979e9f2 100644
 -        const reusableClient = proxyAddress && !ipv6Block
 -            ? Deno.createHttpClient({ proxy: { url: proxyAddress } })
 +    // avoid YouTube's "Please login" errors.
-+    if (proxyAddress || ipv6Block || connectionRotationMs > 0) {
++    const recoveryEnabled = config.networking.connection_recovery_attempts > 0;
++    if (
++        proxyAddress || ipv6Block || connectionRotationMs > 0 || recoveryEnabled
++    ) {
 +        // Without Companion-managed IPv6 rotation, reuse an HTTP client.
 +        // If connection rotation is enabled, this generation is periodically
 +        // retired for new requests while active responses are allowed to drain.
 +        let reusableClient = !ipv6Block &&
-+                (proxyAddress || connectionRotationMs > 0)
++                (proxyAddress || connectionRotationMs > 0 || recoveryEnabled)
 +            ? createReusableClient()
              : undefined;
-
-         return async (
-@@ -49,9 +79,25 @@ export const getFetchClient = (config: Config): {
+ 
+-        return async (
++        const fetchClient = async (
+             input: FetchInputParameter,
              init?: RequestInit,
          ) => {
              let client: Deno.HttpClient;
 +            let generation: ClientGeneration | undefined;
-
+ 
              if (reusableClient) {
 -                client = reusableClient;
 +                if (
 +                    connectionRotationMs > 0 &&
-+                    Date.now() - reusableClient.createdAt >= connectionRotationMs
++                    Date.now() - reusableClient.createdAt >=
++                        connectionRotationMs
 +                ) {
 +                    const retiredClient = reusableClient;
 +                    retiredClient.retired = true;
 +                    reusableClient = createReusableClient();
 +
 +                    if (retiredClient.active === 0) {
-+                        retiredClient.client.close();
++                        closeGeneration(retiredClient);
 +                    }
 +                }
 +
@@ -148,10 +195,10 @@ index bbf70ee..979e9f2 100644
              } else {
                  const clientOptions: Deno.CreateHttpClientOptions = {};
                  if (proxyAddress) {
-@@ -65,25 +111,40 @@ export const getFetchClient = (config: Config): {
+@@ -57,25 +125,44 @@ export const getFetchClient = (config: Config): {
                  client = Deno.createHttpClient(clientOptions);
              }
-
+ 
 -            const fetchRes = await fetchShim(config, retryOptions, input, {
 -                client,
 -                headers: init?.headers,
@@ -167,10 +214,14 @@ index bbf70ee..979e9f2 100644
 +            let fetchRes: Response;
 +            try {
 +                fetchRes = await fetchShim(config, retryOptions, input, {
++                    ...init,
 +                    client,
-+                    headers: init?.headers,
-+                    method: init?.method,
-+                    body: init?.body,
++                    signal: generation
++                        ? AbortSignal.any([
++                            generation.controller.signal,
++                            ...(init?.signal ? [init.signal] : []),
++                        ])
++                        : init?.signal,
                  });
 +            } catch (err) {
 +                if (generation) {
@@ -180,7 +231,7 @@ index bbf70ee..979e9f2 100644
 +                }
 +                throw err;
              }
-
+ 
 -            // For per-request clients (IPv6 rotation), close after body is consumed
              const originalBody = fetchRes.body;
 +            let released = false;
@@ -203,7 +254,7 @@ index bbf70ee..979e9f2 100644
                  return new Response(null, {
                      status: fetchRes.status,
                      headers: fetchRes.headers,
-@@ -114,17 +160,25 @@ export const getFetchClient = (config: Config): {
+@@ -85,17 +172,25 @@ export const getFetchClient = (config: Config): {
              const reader = originalBody.getReader();
              const wrappedBody = new ReadableStream({
                  async pull(controller) {
@@ -237,6 +288,914 @@ index bbf70ee..979e9f2 100644
 +                    }
                  },
              });
-
+ 
+@@ -104,10 +199,87 @@ export const getFetchClient = (config: Config): {
+                 headers: fetchRes.headers,
+             });
+         };
++
++        return Object.assign(fetchClient, {
++            close() {
++                if (reusableClient) {
++                    reusableClient.retired = true;
++                    reusableClient.controller.abort();
++                    closeGeneration(reusableClient);
++                    reusableClient = undefined;
++                }
++            },
++            rotate() {
++                if (reusableClient) {
++                    const retiredClient = reusableClient;
++                    reusableClient = undefined;
++                    retiredClient.retired = true;
++                    retiredClient.controller.abort();
++                    closeGeneration(retiredClient);
++                    reusableClient = createReusableClient();
++                }
++            },
++        });
+     }
+ 
+-    return (input: FetchInputParameter, init?: FetchInitParameterWithClient) =>
+-        fetchShim(config, retryOptions, input, init);
++    return Object.assign(
++        (input: FetchInputParameter, init?: FetchInitParameterWithClient) =>
++            fetchShim(config, retryOptions, input, init),
++        { rotate() {}, close() {} },
++    );
++};
++
++export const getFetchClient = (config: Config): RotatingFetchClient => {
++    const fetchClient = createFetchClient(config);
++    const maxRetries = config.networking.connection_recovery_attempts;
++
++    return Object.assign(async (
++        input: FetchInputParameter,
++        init?: FetchInitParameterWithClient,
++    ): Promise<Response> => {
++        const method = init?.method ??
++            (input instanceof Request ? input.method : "GET");
++        if (!maxRetries || !["GET", "HEAD"].includes(method.toUpperCase())) {
++            return await fetchClient(input, init);
++        }
++
++        const callerSignal = init?.signal ??
++            (input instanceof Request ? input.signal : undefined);
++        let recoverySignal: AbortSignal | undefined;
++        for (let attempt = 0;; attempt++) {
++            const signal = AbortSignal.any([
++                ...(callerSignal ? [callerSignal] : []),
++                ...(recoverySignal ? [recoverySignal] : []),
++            ]);
++            signal.throwIfAborted();
++            try {
++                const response = await fetchClient(input, { ...init, signal });
++                if (response.status !== 403) {
++                    return response;
++                }
++                await response.body?.cancel();
++                fetchClient.rotate();
++                if (attempt >= maxRetries) {
++                    return new Response(null, {
++                        status: 403,
++                        headers: response.headers,
++                    });
++                }
++            } catch (err) {
++                signal.throwIfAborted();
++                fetchClient.rotate();
++                if (attempt >= maxRetries) {
++                    throw err;
++                }
++            }
++            recoverySignal ??= AbortSignal.timeout(
++                config.networking.connection_recovery_timeout_ms,
++            );
++            console.warn(
++                "[WARN] Retrying upstream request on a fresh connection",
++            );
++        }
++    }, { rotate: fetchClient.rotate, close: fetchClient.close });
+ };
+ 
+ function fetchShim(
+@@ -121,11 +293,13 @@ function fetchShim(
+ 
+     const callFetch = () =>
+         fetch(input, {
+-            // only set the AbortSignal if the timeout is supplied in the config
+-            signal: fetchTimeout
+-                ? AbortSignal.timeout(Number(fetchTimeout))
+-                : null,
+             ...(init || {}),
++            signal: AbortSignal.any([
++                ...(init?.signal ? [init.signal] : []),
++                ...(fetchTimeout
++                    ? [AbortSignal.timeout(Number(fetchTimeout))]
++                    : []),
++            ]),
+         });
+     // if retry enabled, call retry with the fetch shim, otherwise pass the fetch shim back directly
+     return fetchRetry ? retry(callFetch, retryOptions) : callFetch();
+diff --git a/src/routes/videoPlaybackProxy.ts b/src/routes/videoPlaybackProxy.ts
+index a6b3a84..bfcf7d9 100644
+--- a/src/routes/videoPlaybackProxy.ts
++++ b/src/routes/videoPlaybackProxy.ts
+@@ -2,7 +2,7 @@ import { Hono } from "hono";
+ import { HTTPException } from "hono/http-exception";
+ import { encodeRFC5987ValueChars } from "../lib/helpers/encodeRFC5987ValueChars.ts";
+ import { decryptQuery } from "../lib/helpers/encryptQuery.ts";
+-import { StreamingApi } from "hono/utils/stream";
++import type { HonoVariables } from "../lib/types/HonoVariables.ts";
+ 
+ let getFetchClientLocation = "getFetchClient";
+ if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
+@@ -17,7 +17,7 @@ if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
+ }
+ const { getFetchClient } = await import(getFetchClientLocation);
+ 
+-const videoPlaybackProxy = new Hono();
++const videoPlaybackProxy = new Hono<{ Variables: HonoVariables }>();
+ 
+ videoPlaybackProxy.options("/", () => {
+     const headersForResponse: Record<string, string> = {
+@@ -115,7 +115,15 @@ videoPlaybackProxy.get("/", async (c) => {
+             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+     }
+ 
+-    const fetchClient = await getFetchClient(config);
++    const fetchClient: typeof fetch & {
++        rotate?: () => void;
++        close?: () => void;
++    } = await getFetchClient(config);
++    const playbackController = new AbortController();
++    const playbackSignal = AbortSignal.any([
++        c.req.raw.signal,
++        playbackController.signal,
++    ]);
+ 
+     let headResponse: Response | undefined;
+     let location = `https://${host}/videoplayback?${queryParams.toString()}`;
+@@ -124,16 +132,24 @@ videoPlaybackProxy.get("/", async (c) => {
+     // A maximum of 5 redirections is defined in the note of the section 7.3
+     // of this RFC, that's why `i < 5`
+     for (let i = 0; i < 5; i++) {
+-        const googlevideoResponse: Response = await fetchClient(location, {
+-            method: "HEAD",
+-            headers: headersToSend,
+-            redirect: "manual",
+-        });
+-        if (googlevideoResponse.status == 403) {
+-            return new Response(googlevideoResponse.body, {
+-                status: googlevideoResponse.status,
+-                statusText: googlevideoResponse.statusText,
++        let googlevideoResponse: Response;
++        try {
++            googlevideoResponse = await fetchClient(location, {
++                method: "HEAD",
++                headers: headersToSend,
++                redirect: "manual",
++                signal: playbackSignal,
+             });
++        } catch {
++            fetchClient.close?.();
++            throw new HTTPException(502, {
++                message: "Upstream video connection failed",
++            });
++        }
++        if (googlevideoResponse.status >= 400) {
++            await googlevideoResponse.body?.cancel();
++            fetchClient.close?.();
++            return new Response(null, { status: googlevideoResponse.status });
+         }
+         if (googlevideoResponse.headers.has("Location")) {
+             location = googlevideoResponse.headers.get("Location") as string;
+@@ -144,6 +160,7 @@ videoPlaybackProxy.get("/", async (c) => {
+         }
+     }
+     if (headResponse === undefined) {
++        fetchClient.close?.();
+         throw new HTTPException(502, {
+             res: new Response(
+                 "Google headResponse redirected too many times",
+@@ -154,27 +171,14 @@ videoPlaybackProxy.get("/", async (c) => {
+     // =================== REQUEST CHUNKING =======================
+     // if the requested response is larger than the chunkSize, break up the response
+     // into chunks and stream the response back to the client to avoid rate limiting
+-    const { readable, writable } = new TransformStream();
+-    const stream = new StreamingApi(writable, readable);
+     const googleVideoUrl = new URL(location);
+-    const getChunk = async (start: number, end: number) => {
+-        googleVideoUrl.searchParams.set(
+-            "range",
+-            `${start}-${end}`,
+-        );
+-        const postResponse = await fetchClient(googleVideoUrl, {
+-            method: "POST",
+-            body: new Uint8Array([0x78, 0]), // protobuf: { 15: 0 } (no idea what it means but this is what YouTube uses),
+-            headers: headersToSend,
+-        });
+-        if (postResponse.status !== 200) {
+-            throw new Error("Non-200 response from google servers");
+-        }
+-        await stream.pipe(postResponse.body);
+-    };
+-
+-    const chunkSize =
+-        config.networking.videoplayback.video_fetch_chunk_size_mb * 1_000_000;
++    const chunkSize = Math.max(
++        1,
++        Math.floor(
++            config.networking.videoplayback.video_fetch_chunk_size_mb *
++                1_000_000,
++        ),
++    );
+     const totalBytes = Number(
+         headResponse.headers.get("Content-Length") || "0",
+     );
+@@ -183,24 +187,118 @@ videoPlaybackProxy.get("/", async (c) => {
+     const wholeRequestStartByte = Number(firstByte || "0");
+     const wholeRequestEndByte = wholeRequestStartByte + Number(totalBytes) - 1;
+ 
+-    let chunk = Promise.resolve();
+-    for (
+-        let startByte = wholeRequestStartByte;
+-        startByte < wholeRequestEndByte;
+-        startByte += chunkSize
+-    ) {
+-        // i.e.
+-        // 0 - 4_999_999, then
+-        // 5_000_000 - 9_999_999, then
+-        // 10_000_000 - 14_999_999
+-        let endByte = startByte + chunkSize - 1;
+-        if (endByte > wholeRequestEndByte) {
+-            endByte = wholeRequestEndByte;
++    const maxRetries = config.networking.connection_recovery_attempts;
++    const readChunks = async function* () {
++        for (
++            let start = wholeRequestStartByte;
++            start <= wholeRequestEndByte;
++            start += chunkSize
++        ) {
++            const end = Math.min(start + chunkSize - 1, wholeRequestEndByte);
++            let offset = start;
++            let retries = 0;
++            let recoverySignal: AbortSignal | undefined;
++            while (offset <= end) {
++                const signal = AbortSignal.any([
++                    playbackSignal,
++                    ...(recoverySignal ? [recoverySignal] : []),
++                ]);
++                signal.throwIfAborted();
++                let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
++                let retryable = true;
++                try {
++                    googleVideoUrl.searchParams.set(
++                        "range",
++                        `${offset}-${end}`,
++                    );
++                    const response = await fetchClient(googleVideoUrl, {
++                        method: "POST",
++                        body: new Uint8Array([0x78, 0]),
++                        headers: headersToSend,
++                        signal,
++                    });
++                    if (response.status !== 200 && response.status !== 206) {
++                        retryable = response.status === 403;
++                        await response.body?.cancel();
++                        throw new Error(
++                            `Upstream video status ${response.status}`,
++                        );
++                    }
++                    const contentRange = response.headers.get("content-range");
++                    if (
++                        contentRange &&
++                        !contentRange.startsWith(`bytes ${offset}-`)
++                    ) {
++                        retryable = false;
++                        await response.body?.cancel();
++                        throw new Error(
++                            "Upstream returned a different byte range",
++                        );
++                    }
++                    reader = response.body?.getReader();
++                    if (!reader) {
++                        throw new Error("Upstream video body is missing");
++                    }
++                    while (offset <= end) {
++                        const { done, value } = await reader.read();
++                        if (done) {
++                            throw new Error("Upstream video body ended early");
++                        }
++                        if (value.byteLength > end - offset + 1) {
++                            retryable = false;
++                            throw new Error(
++                                "Upstream video body exceeds its range",
++                            );
++                        }
++                        yield value;
++                        offset += value.byteLength;
++                    }
++                } catch (err) {
++                    signal.throwIfAborted();
++                    if (!maxRetries || !retryable) {
++                        throw err;
++                    }
++                    fetchClient.rotate?.();
++                    if (retries++ >= maxRetries) {
++                        throw err;
++                    }
++                    recoverySignal ??= AbortSignal.timeout(
++                        config.networking.connection_recovery_timeout_ms,
++                    );
++                    console.warn(
++                        "[WARN] Resuming upstream video on a fresh connection",
++                    );
++                } finally {
++                    if (reader) {
++                        await reader.cancel().catch(() => undefined);
++                        reader.releaseLock();
++                    }
++                }
++            }
+         }
+-        chunk = chunk.then(() => getChunk(startByte, endByte));
+-    }
+-    chunk.catch(() => {
+-        stream.abort();
++    };
++    const chunks = readChunks();
++    const responseBody = new ReadableStream<Uint8Array>({
++        async pull(controller) {
++            try {
++                const { done, value } = await chunks.next();
++                if (done) {
++                    fetchClient.close?.();
++                    controller.close();
++                } else {
++                    controller.enqueue(value);
++                }
++            } catch (err) {
++                playbackController.abort(err);
++                fetchClient.close?.();
++                controller.error(err);
++            }
++        },
++        async cancel(reason) {
++            playbackController.abort(reason);
++            fetchClient.close?.();
++            await chunks.return();
++        },
+     });
+     // =================== REQUEST CHUNKING =======================
+ 
+@@ -247,7 +345,7 @@ videoPlaybackProxy.get("/", async (c) => {
+         }
+     }
+ 
+-    return new Response(stream.responseReadable, {
++    return new Response(responseBody, {
+         status: responseStatus,
+         statusText: headResponse.statusText,
+         headers: headersForResponse,
+diff --git a/src/tests/connectionRotation_test.ts b/src/tests/connectionRotation_test.ts
+new file mode 100644
+index 0000000..954cfdd
+--- /dev/null
++++ b/src/tests/connectionRotation_test.ts
+@@ -0,0 +1,533 @@
++import { assertEquals, assertRejects } from "./deps.ts";
++import { Hono } from "hono";
++import type { HonoVariables } from "../lib/types/HonoVariables.ts";
++import { ConfigSchema } from "../lib/helpers/config.ts";
++import { getFetchClient } from "../lib/helpers/getFetchClient.ts";
++import videoPlaybackProxy from "../routes/videoPlaybackProxy.ts";
++
++function recoveryConfig(attempts = 2, timeout = 10_000) {
++    return ConfigSchema.parse({
++        server: { secret_key: "testSecretKey123" },
++        networking: {
++            connection_recovery_attempts: attempts,
++            connection_recovery_timeout_ms: timeout,
++        },
++    });
++}
++
++type ClientState = { client: Deno.HttpClient; closes: number };
++
++async function withNetworkMock(
++    fetchImpl: typeof fetch,
++    run: (clients: ClientState[]) => Promise<void>,
++) {
++    const originalFetch = globalThis.fetch;
++    const originalCreateClient = Deno.createHttpClient;
++    const clients: ClientState[] = [];
++    try {
++        Deno.createHttpClient = () => {
++            const state: ClientState = {
++                client: {
++                    close() {
++                        state.closes++;
++                    },
++                } as Deno.HttpClient,
++                closes: 0,
++            };
++            clients.push(state);
++            return state.client;
++        };
++        globalThis.fetch = fetchImpl;
++        await run(clients);
++    } finally {
++        globalThis.fetch = originalFetch;
++        Deno.createHttpClient = originalCreateClient;
++    }
++}
++
++function requestPlayback(config = recoveryConfig(), init?: RequestInit) {
++    const app = new Hono<{ Variables: HonoVariables }>();
++    app.use("*", async (context, next) => {
++        context.set("config", config);
++        await next();
++    });
++    app.route("/", videoPlaybackProxy);
++    return app.request(
++        "http://localhost/?host=rr1.googlevideo.com&c=WEB&expire=9999999999",
++        init,
++    );
++}
++
++Deno.test("connection recovery replaces a 403 pool and reuses a healthy pool", async () => {
++    const config = ConfigSchema.parse({
++        server: { secret_key: "testSecretKey123" },
++        networking: { connection_recovery_attempts: 2 },
++    });
++    const originalFetch = globalThis.fetch;
++    const originalCreateClient = Deno.createHttpClient;
++    const clients: { closed: boolean }[] = [];
++    const usedClients: Deno.HttpClient[] = [];
++    try {
++        Deno.createHttpClient = () => {
++            const state = { closed: false };
++            clients.push(state);
++            return {
++                close() {
++                    state.closed = true;
++                },
++            } as Deno.HttpClient;
++        };
++        globalThis.fetch = (_input, init) => {
++            usedClients.push((init as { client: Deno.HttpClient }).client);
++            return Promise.resolve(
++                new Response(null, {
++                    status: usedClients.length === 1 ? 403 : 200,
++                }),
++            );
++        };
++        const fetchClient = getFetchClient(config);
++        assertEquals(
++            (await fetchClient("https://example.com", { method: "HEAD" }))
++                .status,
++            200,
++        );
++        assertEquals(
++            (await fetchClient("https://example.com", { method: "HEAD" }))
++                .status,
++            200,
++        );
++        assertEquals(clients.length, 2);
++        assertEquals(clients[0].closed, true);
++        assertEquals(clients[1].closed, false);
++        assertEquals(usedClients[1], usedClients[2]);
++    } finally {
++        globalThis.fetch = originalFetch;
++        Deno.createHttpClient = originalCreateClient;
++    }
++});
++
++Deno.test("connection recovery is disabled by default", async () => {
++    let calls = 0;
++    await withNetworkMock(() => {
++        calls++;
++        return Promise.resolve(new Response(null, { status: 403 }));
++    }, async (clients) => {
++        const fetchClient = getFetchClient(recoveryConfig(0));
++        assertEquals((await fetchClient("https://example.com")).status, 403);
++        assertEquals(calls, 1);
++        assertEquals(clients.length, 0);
++    });
++});
++
++Deno.test("connection recovery stops at the retry limit", async () => {
++    let calls = 0;
++    await withNetworkMock(() => {
++        calls++;
++        return Promise.resolve(new Response(null, { status: 403 }));
++    }, async (clients) => {
++        const fetchClient = getFetchClient(recoveryConfig());
++        assertEquals((await fetchClient("https://example.com")).status, 403);
++        assertEquals(calls, 3);
++        fetchClient.close();
++        assertEquals(clients.every((client) => client.closes === 1), true);
++    });
++});
++
++Deno.test("connection recovery respects its deadline", async () => {
++    let calls = 0;
++    await withNetworkMock((_input, init) => {
++        if (++calls === 1) {
++            return Promise.resolve(new Response(null, { status: 403 }));
++        }
++        return new Promise((_resolve, reject) => {
++            init!.signal!.addEventListener("abort", () => {
++                reject(init!.signal!.reason);
++            }, { once: true });
++        });
++    }, async () => {
++        const fetchClient = getFetchClient(recoveryConfig(2, 5));
++        await assertRejects(
++            () => fetchClient("https://example.com"),
++            DOMException,
++        );
++        fetchClient.close();
++        assertEquals(calls, 2);
++    });
++});
++
++Deno.test("connection rotation drains old responses but forced rotation aborts them", async () => {
++    const originalNow = Date.now;
++    let now = 0;
++    const signals: AbortSignal[] = [];
++    await withNetworkMock((_input, init) => {
++        signals.push(init!.signal!);
++        return Promise.resolve(new Response(new Uint8Array([1])));
++    }, async (clients) => {
++        try {
++            Date.now = () => now;
++            const config = recoveryConfig();
++            config.networking.connection_rotation_ms = 10;
++            const fetchClient = getFetchClient(config);
++            const first = await fetchClient("https://example.com");
++            now = 11;
++            const second = await fetchClient("https://example.com");
++            assertEquals(clients[0].closes, 0);
++            assertEquals(signals[0].aborted, false);
++            await first.body!.cancel();
++            assertEquals(clients[0].closes, 1);
++            fetchClient.rotate();
++            assertEquals(signals[1].aborted, true);
++            assertEquals(clients[1].closes, 1);
++            await second.body!.cancel();
++            assertEquals(clients[1].closes, 1);
++            fetchClient.close();
++        } finally {
++            Date.now = originalNow;
++        }
++    });
++});
++
++Deno.test("playback resumes a truncated chunk from the next undelivered byte", async () => {
++    const ranges: string[] = [];
++    await withNetworkMock((input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        ranges.push(new URL(String(input)).searchParams.get("range")!);
++        return Promise.resolve(
++            new Response(
++                ranges.length === 1
++                    ? new Uint8Array([1, 2])
++                    : new Uint8Array([3, 4]),
++            ),
++        );
++    }, async (clients) => {
++        const response = await requestPlayback();
++        assertEquals(response.status, 200);
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([1, 2, 3, 4]),
++        );
++        assertEquals(ranges, ["0-3", "2-3"]);
++        assertEquals(clients.every((client) => client.closes === 1), true);
++    });
++});
++
++Deno.test("playback handles multiple chunks and a final single byte", async () => {
++    const ranges: string[] = [];
++    await withNetworkMock((input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "5" },
++                }),
++            );
++        }
++        const range = new URL(String(input)).searchParams.get("range")!;
++        ranges.push(range);
++        const [start, end] = range.split("-").map(Number);
++        return Promise.resolve(
++            new Response(
++                new Uint8Array(
++                    Array.from(
++                        { length: end - start + 1 },
++                        (_, index) => start + index,
++                    ),
++                ),
++            ),
++        );
++    }, async () => {
++        const config = recoveryConfig();
++        config.networking.videoplayback.video_fetch_chunk_size_mb = 0.000002;
++        const response = await requestPlayback(config);
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([0, 1, 2, 3, 4]),
++        );
++        assertEquals(ranges, ["0-1", "2-3", "4-4"]);
++    });
++});
++
++Deno.test("playback preserves a requested range across recovery", async () => {
++    const ranges: string[] = [];
++    await withNetworkMock((input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        ranges.push(new URL(String(input)).searchParams.get("range")!);
++        return Promise.resolve(
++            new Response(
++                ranges.length === 1
++                    ? new Uint8Array([5, 6])
++                    : new Uint8Array([7, 8]),
++            ),
++        );
++    }, async () => {
++        const response = await requestPlayback(recoveryConfig(), {
++            headers: { range: "bytes=5-8" },
++        });
++        assertEquals(response.status, 206);
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([5, 6, 7, 8]),
++        );
++        assertEquals(ranges, ["5-8", "7-8"]);
++    });
++});
++
++Deno.test("playback stops retrying a persistent chunk 403", async () => {
++    let posts = 0;
++    await withNetworkMock((_input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        posts++;
++        return Promise.resolve(new Response(null, { status: 403 }));
++    }, async (clients) => {
++        const response = await requestPlayback();
++        await assertRejects(
++            () => response.arrayBuffer(),
++            Error,
++            "Upstream video status 403",
++        );
++        assertEquals(posts, 3);
++        assertEquals(clients.every((client) => client.closes === 1), true);
++    });
++});
++
++Deno.test("playback cancellation aborts pending recovery and closes its pool", async () => {
++    const started = Promise.withResolvers<void>();
++    let signal: AbortSignal | undefined;
++    await withNetworkMock((_input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        signal = init!.signal!;
++        started.resolve();
++        return new Promise((_resolve, reject) => {
++            signal!.addEventListener("abort", () => reject(signal!.reason), {
++                once: true,
++            });
++        });
++    }, async (clients) => {
++        const response = await requestPlayback();
++        const reader = response.body!.getReader();
++        const pending = reader.read();
++        await started.promise;
++        await reader.cancel();
++        assertEquals((await pending).done, true);
++        assertEquals(signal!.aborted, true);
++        assertEquals(clients.every((client) => client.closes === 1), true);
++    });
++});
++
++Deno.test("playback keeps its response open across a chunk 403", async () => {
++    const config = ConfigSchema.parse({
++        server: { secret_key: "testSecretKey123" },
++        networking: { connection_recovery_attempts: 2 },
++    });
++    const originalFetch = globalThis.fetch;
++    const ranges: string[] = [];
++    try {
++        globalThis.fetch = (input, init) => {
++            if (init?.method === "HEAD") {
++                return Promise.resolve(
++                    new Response(null, {
++                        headers: { "content-length": "4" },
++                    }),
++                );
++            }
++            ranges.push(new URL(String(input)).searchParams.get("range")!);
++            return Promise.resolve(
++                ranges.length === 1
++                    ? new Response(null, { status: 403 })
++                    : new Response(new Uint8Array([1, 2, 3, 4])),
++            );
++        };
++        const app = new Hono<{ Variables: HonoVariables }>();
++        app.use("*", async (context, next) => {
++            context.set("config", config);
++            await next();
++        });
++        app.route("/", videoPlaybackProxy);
++        const response = await app.request(
++            "http://localhost/?host=rr1.googlevideo.com&c=WEB&expire=9999999999",
++        );
++        assertEquals(response.status, 200);
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([1, 2, 3, 4]),
++        );
++        assertEquals(ranges, ["0-3", "0-3"]);
++    } finally {
++        globalThis.fetch = originalFetch;
++    }
++});
++
++Deno.test("playback resumes after an upstream body read error", async () => {
++    const ranges: string[] = [];
++    await withNetworkMock((input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        ranges.push(new URL(String(input)).searchParams.get("range")!);
++        let pulls = 0;
++        return Promise.resolve(
++            new Response(
++                ranges.length === 1
++                    ? new ReadableStream<Uint8Array>({
++                        pull(controller) {
++                            if (pulls++ === 0) {
++                                controller.enqueue(new Uint8Array([1, 2]));
++                            } else {
++                                controller.error(new Error("Connection reset"));
++                            }
++                        },
++                    }, { highWaterMark: 0 })
++                    : new Uint8Array([3, 4]),
++            ),
++        );
++    }, async () => {
++        const response = await requestPlayback();
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([1, 2, 3, 4]),
++        );
++        assertEquals(ranges, ["0-3", "2-3"]);
++    });
++});
++
++Deno.test("playback recovery has a deadline while reconnecting", async () => {
++    let posts = 0;
++    await withNetworkMock((_input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        if (++posts === 1) {
++            return Promise.resolve(new Response(null, { status: 403 }));
++        }
++        return new Promise((_resolve, reject) => {
++            init!.signal!.addEventListener("abort", () => {
++                reject(init!.signal!.reason);
++            }, { once: true });
++        });
++    }, async (clients) => {
++        const response = await requestPlayback(recoveryConfig(2, 5));
++        await assertRejects(() => response.arrayBuffer(), DOMException);
++        assertEquals(posts, 2);
++        assertEquals(clients.every((client) => client.closes === 1), true);
++    });
++});
++
++Deno.test("playback recovers its HEAD request before sending downstream headers", async () => {
++    let heads = 0;
++    await withNetworkMock((_input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                ++heads === 1
++                    ? new Response(null, { status: 403 })
++                    : new Response(null, {
++                        headers: { "content-length": "1" },
++                    }),
++            );
++        }
++        return Promise.resolve(new Response(new Uint8Array([7])));
++    }, async () => {
++        const response = await requestPlayback();
++        assertEquals(response.status, 200);
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([7]),
++        );
++        assertEquals(heads, 2);
++    });
++});
++
++Deno.test("playback reports exhausted pre-header connection failures as 502", async () => {
++    let calls = 0;
++    await withNetworkMock(() => {
++        calls++;
++        return Promise.reject(new TypeError("Connection refused"));
++    }, async (clients) => {
++        const response = await requestPlayback();
++        assertEquals(response.status, 502);
++        assertEquals(calls, 3);
++        assertEquals(clients.every((client) => client.closes === 1), true);
++        await response.body?.cancel();
++    });
++});
++
++Deno.test("playback rejects mismatched ranges without forwarding corrupt data", async () => {
++    let posts = 0;
++    await withNetworkMock((_input, init) => {
++        if (init?.method === "HEAD") {
++            return Promise.resolve(
++                new Response(null, {
++                    headers: { "content-length": "4" },
++                }),
++            );
++        }
++        posts++;
++        return Promise.resolve(
++            new Response(new Uint8Array([1, 2, 3, 4]), {
++                headers: { "content-range": "bytes 20-23/100" },
++            }),
++        );
++    }, async () => {
++        const response = await requestPlayback();
++        await assertRejects(
++            () => response.arrayBuffer(),
++            Error,
++            "different byte range",
++        );
++        assertEquals(posts, 1);
++    });
++});
++
++Deno.test("real HTTP sockets are replaced on 403 and reused after recovery", async () => {
++    const ports: number[] = [];
++    const server = Deno.serve({
++        hostname: "127.0.0.1",
++        port: 0,
++        onListen() {},
++    }, (_request, info) => {
++        ports.push(info.remoteAddr.port);
++        return new Response(null, { status: ports.length === 1 ? 403 : 200 });
++    });
++    const fetchClient = getFetchClient(recoveryConfig());
++    try {
++        const url = `http://127.0.0.1:${server.addr.port}/`;
++        assertEquals((await fetchClient(url, { method: "HEAD" })).status, 200);
++        assertEquals((await fetchClient(url, { method: "HEAD" })).status, 200);
++        assertEquals(ports.length, 3);
++        assertEquals(ports[0] === ports[1], false);
++        assertEquals(ports[1], ports[2]);
++    } finally {
++        fetchClient.close();
++        await server.shutdown();
++    }
++});
 -- 
-2.55.0
+2.56.0

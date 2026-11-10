@@ -24,19 +24,37 @@ networking.connection_recovery_timeout_ms to enable it.
 
 Include cancellation, pool cleanup, range validation, and regression tests
 covering simulated failures and real HTTP connection replacement.
+
+Recover specific temporary player errors by sharing session and PO-token
+refreshes across requests, startup, and scheduled regeneration. Hold affected
+requests for a bounded interval, retry with the replacement session, and
+return explanatory player errors or readable 503 responses on exhaustion.
+
+Add refresh cooldowns, stale-session handling, graceful API pool retirement,
+and endpoint tests without routing token validation back into recovery.
 ---
- config/config.example.toml           |   9 +
- src/lib/helpers/config.ts            |  11 +
- src/lib/helpers/getFetchClient.ts    | 252 ++++++++++++++---
- src/routes/videoPlaybackProxy.ts     | 198 +++++++++----
- src/tests/connectionRotation_test.ts | 533 +++++++++++++++++++++++++++++++++++
- 5 files changed, 914 insertions(+), 89 deletions(-)
+ config/config.example.toml                   |  12 +
+ src/lib/helpers/config.ts                    |  11 +
+ src/lib/helpers/getFetchClient.ts            | 266 +++++++++++--
+ src/lib/helpers/youtubePlayerHandling.ts     |  43 ++-
+ src/lib/helpers/youtubeSessionRecovery.ts    | 185 +++++++++
+ src/lib/jobs/potoken.ts                      |  18 +-
+ src/lib/types/HonoVariables.ts               |   2 +
+ src/main.ts                                  |  86 +++--
+ src/routes/invidious_routes/captions.ts      |   9 +-
+ src/routes/invidious_routes/dashManifest.ts  |  12 +-
+ src/routes/invidious_routes/latestVersion.ts |  12 +-
+ src/routes/videoPlaybackProxy.ts             | 198 +++++++---
+ src/routes/youtube_api_routes/player.ts      |   5 +-
+ src/tests/connectionRotation_test.ts         | 552 +++++++++++++++++++++++++++
+ src/tests/youtubeSessionRecovery_test.ts     | 430 +++++++++++++++++++++
+ 15 files changed, 1698 insertions(+), 143 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
-index 54579df..b39a9a7 100644
+index 54579df..545f296 100644
 --- a/config/config.example.toml
 +++ b/config/config.example.toml
-@@ -42,6 +42,15 @@
+@@ -42,6 +42,18 @@
  # # This requires IPv6 setup: https://github.com/iv-org/invidious-companion/wiki/How-to-send-IPv6-requests-with-a-new-IPv6-address-for-each-request-on-a-server-with-a-whole-IPv6-range
  # # Randomizes all bits after the block prefix (e.g., /32 randomizes bits 33-128)
  # #ipv6_block = "2001:db8::/32" # env variable: NETWORKING_IPV6_BLOCK
@@ -45,9 +63,12 @@ index 54579df..b39a9a7 100644
 +# # Set to 0 to disable connection rotation.
 +# connection_rotation_ms = 0 # env variable: NETWORKING_CONNECTION_ROTATION_MS
 +# # Extra attempts on fresh connections after validation/playback failures.
++# # Specific temporary player errors also trigger a shared session/PO-token refresh.
 +# # Set to 0 to disable failure recovery. Healthy connections remain reusable.
 +# connection_recovery_attempts = 0 # env variable: NETWORKING_CONNECTION_RECOVERY_ATTEMPTS
 +# # Recovery window after the first failure, including the remaining video chunk.
++# # Also bounds waiting for a session refresh and sets its minimum retry interval.
++# # A shared session refresh may continue after an individual request times out.
 +# connection_recovery_timeout_ms = 10000 # env variable: NETWORKING_CONNECTION_RECOVERY_TIMEOUT_MS
  
  # [networking.videoplayback]
@@ -75,10 +96,10 @@ index 96b53b1..a4713b4 100644
              timeout_ms: z.number().default(
                  Number(Deno.env.get("NETWORKING_FETCH_TIMEOUT_MS")) || 30_000,
 diff --git a/src/lib/helpers/getFetchClient.ts b/src/lib/helpers/getFetchClient.ts
-index bbf70ee..c47fe54 100644
+index bbf70ee..559bea2 100644
 --- a/src/lib/helpers/getFetchClient.ts
 +++ b/src/lib/helpers/getFetchClient.ts
-@@ -8,14 +8,28 @@ type FetchInitParameterWithClient =
+@@ -8,14 +8,29 @@ type FetchInitParameterWithClient =
      | RequestInit & { client: Deno.HttpClient };
  type FetchReturn = ReturnType<typeof fetch>;
  
@@ -91,6 +112,7 @@ index bbf70ee..c47fe54 100644
 -} => {
 +    rotate(): void;
 +    close(): void;
++    retire(): void;
 +};
 +
 +type ClientGeneration = {
@@ -109,7 +131,7 @@ index bbf70ee..c47fe54 100644
  
      const fetchMaxAttempts = config.networking.fetch?.retry?.times;
      const fetchInitialDebounce = config.networking.fetch?.retry
-@@ -29,23 +43,77 @@ export const getFetchClient = (config: Config): {
+@@ -29,23 +44,77 @@ export const getFetchClient = (config: Config): {
          jitter: 0,
      };
  
@@ -195,7 +217,7 @@ index bbf70ee..c47fe54 100644
              } else {
                  const clientOptions: Deno.CreateHttpClientOptions = {};
                  if (proxyAddress) {
-@@ -57,25 +125,44 @@ export const getFetchClient = (config: Config): {
+@@ -57,25 +126,44 @@ export const getFetchClient = (config: Config): {
                  client = Deno.createHttpClient(clientOptions);
              }
  
@@ -254,7 +276,7 @@ index bbf70ee..c47fe54 100644
                  return new Response(null, {
                      status: fetchRes.status,
                      headers: fetchRes.headers,
-@@ -85,17 +172,25 @@ export const getFetchClient = (config: Config): {
+@@ -85,17 +173,25 @@ export const getFetchClient = (config: Config): {
              const reader = originalBody.getReader();
              const wrappedBody = new ReadableStream({
                  async pull(controller) {
@@ -289,12 +311,21 @@ index bbf70ee..c47fe54 100644
                  },
              });
  
-@@ -104,10 +199,87 @@ export const getFetchClient = (config: Config): {
+@@ -104,10 +200,100 @@ export const getFetchClient = (config: Config): {
                  headers: fetchRes.headers,
              });
          };
 +
 +        return Object.assign(fetchClient, {
++            retire() {
++                if (reusableClient) {
++                    reusableClient.retired = true;
++                    if (reusableClient.active === 0) {
++                        closeGeneration(reusableClient);
++                    }
++                    reusableClient = undefined;
++                }
++            },
 +            close() {
 +                if (reusableClient) {
 +                    reusableClient.retired = true;
@@ -321,7 +352,7 @@ index bbf70ee..c47fe54 100644
 +    return Object.assign(
 +        (input: FetchInputParameter, init?: FetchInitParameterWithClient) =>
 +            fetchShim(config, retryOptions, input, init),
-+        { rotate() {}, close() {} },
++        { rotate() {}, close() {}, retire() {} },
 +    );
 +};
 +
@@ -375,11 +406,15 @@ index bbf70ee..c47fe54 100644
 +                "[WARN] Retrying upstream request on a fresh connection",
 +            );
 +        }
-+    }, { rotate: fetchClient.rotate, close: fetchClient.close });
++    }, {
++        rotate: fetchClient.rotate,
++        close: fetchClient.close,
++        retire: fetchClient.retire,
++    });
  };
  
  function fetchShim(
-@@ -121,11 +293,13 @@ function fetchShim(
+@@ -121,11 +307,13 @@ function fetchShim(
  
      const callFetch = () =>
          fetch(input, {
@@ -397,6 +432,626 @@ index bbf70ee..c47fe54 100644
          });
      // if retry enabled, call retry with the fetch shim, otherwise pass the fetch shim back directly
      return fetchRetry ? retry(callFetch, retryOptions) : callFetch();
+diff --git a/src/lib/helpers/youtubePlayerHandling.ts b/src/lib/helpers/youtubePlayerHandling.ts
+index 3c6df51..af7e84b 100644
+--- a/src/lib/helpers/youtubePlayerHandling.ts
++++ b/src/lib/helpers/youtubePlayerHandling.ts
+@@ -18,6 +18,7 @@ const { youtubePlayerReq } = await import(youtubePlayerReqLocation);
+ 
+ import type { Config } from "./config.ts";
+ import { getKv } from "./kv.ts";
++import type { YoutubeSessionRecovery } from "./youtubeSessionRecovery.ts";
+ 
+ export const youtubePlayerParsing = async ({
+     innertubeClient,
+@@ -26,6 +27,8 @@ export const youtubePlayerParsing = async ({
+     tokenMinter,
+     metrics,
+     overrideCache = false,
++    sessionRecovery,
++    signal,
+ }: {
+     innertubeClient: Innertube;
+     videoId: string;
+@@ -33,6 +36,8 @@ export const youtubePlayerParsing = async ({
+     tokenMinter: TokenMinter;
+     metrics: Metrics | undefined;
+     overrideCache?: boolean;
++    sessionRecovery?: YoutubeSessionRecovery;
++    signal?: AbortSignal;
+ }): Promise<object> => {
+     const cacheEnabled = overrideCache ? false : config.cache.enabled;
+     const kv = await getKv(config);
+@@ -40,18 +45,28 @@ export const youtubePlayerParsing = async ({
+     const videoCached = (await kv.get(["video_cache", videoId]))
+         .value as Uint8Array;
+ 
+-    if (videoCached != null && cacheEnabled) {
++    if (videoCached != null && cacheEnabled && !sessionRecovery?.isRefreshing) {
+         return JSON.parse(new TextDecoder().decode(decompress(videoCached)));
+     } else {
+-        const youtubePlayerResponse = await youtubePlayerReq(
+-            innertubeClient,
+-            videoId,
+-            config,
+-            tokenMinter,
+-        );
++        const youtubePlayerResponse: ApiResponse = sessionRecovery
++            ? await sessionRecovery.player((session) => {
++                innertubeClient = session.innertubeClient;
++                return youtubePlayerReq(
++                    innertubeClient,
++                    videoId,
++                    config,
++                    session.tokenMinter ?? tokenMinter,
++                );
++            }, signal)
++            : await youtubePlayerReq(
++                innertubeClient,
++                videoId,
++                config,
++                tokenMinter,
++            );
+         const videoData = youtubePlayerResponse.data;
+ 
+-        if (videoData.playabilityStatus.status === "ERROR") {
++        if (videoData.playabilityStatus?.status === "ERROR") {
+             return videoData;
+         }
+ 
+@@ -66,16 +81,16 @@ export const youtubePlayerParsing = async ({
+         // Modify the original YouTube response to include deciphered URLs
+         if (streamingData && videoData && videoData.streamingData) {
+             const ecatcherServiceTracking = videoData.responseContext
+-                ?.serviceTrackingParams.find((o: { service: string }) =>
+-                    o.service === "ECATCHER"
++                ?.serviceTrackingParams?.find((tracking) =>
++                    tracking.service === "ECATCHER"
+                 );
+             const clientNameUsed = ecatcherServiceTracking?.params?.find((
+-                o: { key: string },
+-            ) => o.key === "client.name");
++                parameter,
++            ) => parameter.key === "client.name");
+             // no need to decipher on IOS nor ANDROID
+             if (
+-                !clientNameUsed?.value.includes("IOS") &&
+-                !clientNameUsed?.value.includes("ANDROID")
++                !clientNameUsed?.value?.includes("IOS") &&
++                !clientNameUsed?.value?.includes("ANDROID")
+             ) {
+                 for (
+                     let index = 0;
+diff --git a/src/lib/helpers/youtubeSessionRecovery.ts b/src/lib/helpers/youtubeSessionRecovery.ts
+new file mode 100644
+index 0000000..f8bdf92
+--- /dev/null
++++ b/src/lib/helpers/youtubeSessionRecovery.ts
+@@ -0,0 +1,185 @@
++import { abortable } from "@std/async";
++import type { ApiResponse, Innertube } from "youtubei.js";
++import { z } from "zod";
++import type { TokenMinter } from "../jobs/potoken.ts";
++
++export type YoutubeSession = {
++    innertubeClient: Innertube;
++    tokenMinter?: TokenMinter;
++    rotate?: () => void;
++    retire?: () => void;
++};
++
++const TextSchema = z.object({
++    simpleText: z.string().optional(),
++    runs: z.array(z.object({ text: z.string() })).optional(),
++});
++
++const PlayabilitySchema = z.object({
++    status: z.enum(["ERROR", "UNPLAYABLE"]),
++    reason: z.string().optional(),
++    errorScreen: z.object({
++        playerErrorMessageRenderer: z.object({
++            reason: TextSchema.optional(),
++            subreason: TextSchema.optional(),
++        }),
++    }).optional(),
++});
++
++const REFRESHING_MESSAGE =
++    "Companion is refreshing its YouTube connection. Please try again shortly.";
++const FAILED_MESSAGE =
++    "Companion could not restore its YouTube connection. Please try again shortly.";
++
++export function sessionRecoveryMessage(data: unknown): string | undefined {
++    const parsed = z.object({
++        playabilityStatus: z.object({
++            status: z.literal("ERROR"),
++            reason: z.enum([REFRESHING_MESSAGE, FAILED_MESSAGE]),
++        }),
++    }).safeParse(data);
++    return parsed.success ? parsed.data.playabilityStatus.reason : undefined;
++}
++
++export function isTemporaryPlayerFailure(response: ApiResponse): boolean {
++    const parsed = PlayabilitySchema.safeParse(
++        response.data?.playabilityStatus,
++    );
++    if (!parsed.success) return false;
++    const renderer = parsed.data.errorScreen?.playerErrorMessageRenderer;
++    const text = (value: z.infer<typeof TextSchema> | undefined) =>
++        value?.simpleText ?? value?.runs?.map((run) => run.text).join("");
++    const reason = parsed.data.reason ?? text(renderer?.reason);
++    const subreason = text(renderer?.subreason);
++    return [
++        reason,
++        text(renderer?.reason),
++        subreason,
++        [reason, subreason].filter(Boolean).join(" "),
++    ]
++        .some((value) =>
++            typeof value === "string" &&
++            /^this content (?:isn't|is not) available[,!.]? try again later[.!]?$/
++                .test(
++                    value.replace(/\u2019/g, "'").replace(/\s+/g, " ").trim()
++                        .toLowerCase(),
++                )
++        );
++}
++
++export class YoutubeSessionRecovery {
++    #current: YoutubeSession;
++    #refreshing: Promise<YoutubeSession> | undefined;
++    #lastRecoveryAt = -Infinity;
++
++    constructor(
++        initial: YoutubeSession,
++        private readonly createSession: () => Promise<YoutubeSession>,
++        private readonly options: { attempts: number; timeoutMs: number },
++    ) {
++        this.#current = initial;
++    }
++
++    get current(): YoutubeSession {
++        return this.#current;
++    }
++
++    get isRefreshing(): boolean {
++        return this.#refreshing !== undefined;
++    }
++
++    refresh(failedClient?: Innertube): Promise<YoutubeSession> {
++        if (this.#refreshing) return this.#refreshing;
++        if (failedClient && failedClient !== this.#current.innertubeClient) {
++            return Promise.resolve(this.#current);
++        }
++        if (failedClient) {
++            if (Date.now() - this.#lastRecoveryAt < this.options.timeoutMs) {
++                return Promise.reject(
++                    new Error("Session recovery is cooling down"),
++                );
++            }
++            this.#lastRecoveryAt = Date.now();
++            this.#current.rotate?.();
++            console.warn(
++                "[WARN] Refreshing YouTube session after a temporary player failure",
++            );
++        }
++        const previous = this.#current;
++        this.#refreshing = Promise.resolve().then(() => this.createSession())
++            .then((session) => {
++                this.#current = session;
++                previous.retire?.();
++                return session;
++            }).finally(() => {
++                this.#refreshing = undefined;
++            });
++        return this.#refreshing;
++    }
++
++    async player(
++        request: (session: YoutubeSession) => Promise<ApiResponse>,
++        callerSignal?: AbortSignal,
++    ): Promise<ApiResponse> {
++        callerSignal?.throwIfAborted();
++        if (!this.options.attempts) return await request(this.#current);
++
++        let recoverySignal: AbortSignal | undefined;
++        const wait = <Result>(promise: Promise<Result>) => {
++            recoverySignal ??= AbortSignal.any([
++                AbortSignal.timeout(this.options.timeoutMs),
++                ...(callerSignal ? [callerSignal] : []),
++            ]);
++            return abortable(promise, recoverySignal);
++        };
++        let session = this.#current;
++        let response: ApiResponse | undefined;
++        if (this.#refreshing) {
++            try {
++                session = await wait(this.#refreshing);
++                response = await wait(request(session));
++            } catch {
++                callerSignal?.throwIfAborted();
++                return this.unavailable();
++            }
++        } else {
++            response = await request(session);
++        }
++        if (!isTemporaryPlayerFailure(response)) return response;
++
++        try {
++            for (let attempt = 0; attempt < this.options.attempts; attempt++) {
++                callerSignal?.throwIfAborted();
++                recoverySignal?.throwIfAborted();
++                session = await wait(this.refresh(session.innertubeClient));
++                response = await wait(request(session));
++                if (!isTemporaryPlayerFailure(response)) return response;
++            }
++        } catch {
++            callerSignal?.throwIfAborted();
++        }
++        return this.unavailable(response);
++    }
++
++    private unavailable(response?: ApiResponse): ApiResponse {
++        const message = this.isRefreshing ? REFRESHING_MESSAGE : FAILED_MESSAGE;
++        return {
++            success: true,
++            status_code: 200,
++            ...response,
++            data: {
++                ...response?.data,
++                playabilityStatus: {
++                    status: "ERROR",
++                    reason: message,
++                    errorScreen: {
++                        playerErrorMessageRenderer: {
++                            reason: { simpleText: message },
++                            subreason: { simpleText: message },
++                        },
++                    },
++                },
++            },
++        };
++    }
++}
+diff --git a/src/lib/jobs/potoken.ts b/src/lib/jobs/potoken.ts
+index 8d8fa7d..899b2e9 100644
+--- a/src/lib/jobs/potoken.ts
++++ b/src/lib/jobs/potoken.ts
+@@ -5,6 +5,7 @@ import {
+ } from "../helpers/youtubePlayerHandling.ts";
+ import type { Config } from "../helpers/config.ts";
+ import { Metrics } from "../helpers/metrics.ts";
++import type { RotatingFetchClient } from "../helpers/getFetchClient.ts";
+ let getFetchClientLocation = "getFetchClient";
+ if (Deno.env.get("GET_FETCH_CLIENT_LOCATION")) {
+     if (Deno.env.has("DENO_COMPILED")) {
+@@ -61,7 +62,12 @@ export type TokenMinter = ReturnType<typeof createMinter>;
+ export const poTokenGenerate = (
+     config: Config,
+     metrics: Metrics | undefined,
+-): Promise<{ innertubeClient: Innertube; tokenMinter: TokenMinter }> => {
++): Promise<{
++    innertubeClient: Innertube;
++    tokenMinter: TokenMinter;
++    rotate: () => void;
++    retire: () => void;
++}> => {
+     const { promise, resolve, reject } = Promise.withResolvers<
+         Awaited<ReturnType<typeof poTokenGenerate>>
+     >();
+@@ -75,6 +81,7 @@ export const poTokenGenerate = (
+     );
+     // take note of the worker so we can kill it once a new one takes its place
+     workers.push(worker);
++    let sessionFetch: RotatingFetchClient | undefined;
+     worker.addEventListener("message", async (event) => {
+         const parsedMessage = OutputMessageSchema.parse(event.data);
+ 
+@@ -89,17 +96,19 @@ export const poTokenGenerate = (
+         if (parsedMessage.type === "error") {
+             console.log({ errorFromWorker: parsedMessage.error });
+             worker.terminate();
++            sessionFetch?.close?.();
+             reject(parsedMessage.error);
+         }
+ 
+         // worker is initialised and has passed back a session token and visitor data
+         if (parsedMessage.type === "initialised") {
+             try {
++                sessionFetch = getFetchClient(config);
+                 const instantiatedInnertubeClient = await Innertube.create({
+                     enable_session_cache: false,
+                     po_token: parsedMessage.sessionPoToken,
+                     visitor_data: parsedMessage.visitorData,
+-                    fetch: getFetchClient(config),
++                    fetch: sessionFetch,
+                     generate_session_locally: true,
+                     cookie: config.youtube_session.cookies || undefined,
+                     player_id: PLAYER_ID,
+@@ -121,12 +130,15 @@ export const poTokenGenerate = (
+                 return resolve({
+                     innertubeClient: instantiatedInnertubeClient,
+                     tokenMinter: minter,
++                    rotate: () => sessionFetch?.rotate?.(),
++                    retire: () => sessionFetch?.retire?.(),
+                 });
+             } catch (err) {
+                 console.log("[WARN] Failed to get valid PO token, will retry", {
+                     err,
+                 });
+                 worker.terminate();
++                sessionFetch?.close?.();
+                 reject(err);
+             }
+         }
+@@ -248,5 +260,7 @@ async function checkToken({
+     } catch (err) {
+         console.log("Failed to validate PO token using search method", { err });
+         throw err;
++    } finally {
++        fetchImpl.close?.();
+     }
+ }
+diff --git a/src/lib/types/HonoVariables.ts b/src/lib/types/HonoVariables.ts
+index f1e64d5..d504d24 100644
+--- a/src/lib/types/HonoVariables.ts
++++ b/src/lib/types/HonoVariables.ts
+@@ -2,10 +2,12 @@ import { Innertube } from "youtubei.js";
+ import type { TokenMinter } from "../jobs/potoken.ts";
+ import type { Config } from "../helpers/config.ts";
+ import { Metrics } from "../helpers/metrics.ts";
++import type { YoutubeSessionRecovery } from "../helpers/youtubeSessionRecovery.ts";
+ 
+ export type HonoVariables = {
+     innertubeClient: Innertube;
+     config: Config;
+     tokenMinter: TokenMinter | undefined;
+     metrics: Metrics | undefined;
++    sessionRecovery?: YoutubeSessionRecovery;
+ };
+diff --git a/src/main.ts b/src/main.ts
+index a6a7eaa..4bff6ed 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -1,7 +1,7 @@
+ import { Hono } from "hono";
+ import { companionRoutes, miscRoutes } from "./routes/index.ts";
+ import { Innertube, Platform } from "youtubei.js";
+-import { poTokenGenerate, type TokenMinter } from "./lib/jobs/potoken.ts";
++import { poTokenGenerate } from "./lib/jobs/potoken.ts";
+ import { USER_AGENT } from "bgutils";
+ import { retry } from "@std/async";
+ import type { HonoVariables } from "./lib/types/HonoVariables.ts";
+@@ -13,6 +13,7 @@ const config = await parseConfig();
+ import { Metrics } from "./lib/helpers/metrics.ts";
+ import { PLAYER_ID } from "./constants.ts";
+ import { jsInterpreter } from "./lib/helpers/jsInterpreter.ts";
++import { YoutubeSessionRecovery } from "./lib/helpers/youtubeSessionRecovery.ts";
+ 
+ const args = parseArgs(Deno.args);
+ 
+@@ -47,8 +48,6 @@ const companionApp = new Hono({
+ }).basePath(config.server.base_path);
+ const metrics = config.server.enable_metrics ? new Metrics() : undefined;
+ 
+-let tokenMinter: TokenMinter | undefined;
+-let innertubeClient: Innertube;
+ let innertubeClientFetchPlayer = true;
+ const innertubeClientOauthEnabled = config.youtube_session.oauth_enabled;
+ const innertubeClientJobPoTokenEnabled =
+@@ -73,29 +72,56 @@ if (!innertubeClientOauthEnabled) {
+ 
+ Platform.shim.eval = jsInterpreter;
+ 
+-innertubeClient = await Innertube.create({
++const initialFetchClient = getFetchClient(config);
++const innertubeClient = await Innertube.create({
+     enable_session_cache: false,
+     retrieve_player: innertubeClientFetchPlayer,
+-    fetch: getFetchClient(config),
++    fetch: initialFetchClient,
+     cookie: innertubeClientCookies || undefined,
+     user_agent: USER_AGENT,
+     player_id: PLAYER_ID,
+ });
+ 
++const sessionRecovery = new YoutubeSessionRecovery({
++    innertubeClient,
++    rotate: () => initialFetchClient.rotate?.(),
++    retire: () => initialFetchClient.retire?.(),
++}, async () => {
++    if (innertubeClientJobPoTokenEnabled) {
++        return await poTokenGenerate(config, metrics);
++    }
++    const fetchClient = getFetchClient(config);
++    try {
++        const client = await Innertube.create({
++            enable_session_cache: false,
++            fetch: fetchClient,
++            retrieve_player: innertubeClientFetchPlayer,
++            user_agent: USER_AGENT,
++            cookie: innertubeClientCookies || undefined,
++            player_id: PLAYER_ID,
++        });
++        return {
++            innertubeClient: client,
++            rotate: () => fetchClient.rotate?.(),
++            retire: () => fetchClient.retire?.(),
++        };
++    } catch (err) {
++        fetchClient.close?.();
++        throw err;
++    }
++}, {
++    attempts: config.networking.connection_recovery_attempts,
++    timeoutMs: config.networking.connection_recovery_timeout_ms,
++});
++
+ if (!innertubeClientOauthEnabled) {
+     if (innertubeClientJobPoTokenEnabled) {
+         // Initialize tokenMinter in background to not block server startup
+         console.log("[INFO] Starting PO token generation in background...");
+         retry(
+-            poTokenGenerate.bind(
+-                poTokenGenerate,
+-                config,
+-                metrics,
+-            ),
++            () => sessionRecovery.refresh(),
+             { minTimeout: 1_000, maxTimeout: 60_000, multiplier: 5, jitter: 0 },
+-        ).then((result) => {
+-            innertubeClient = result.innertubeClient;
+-            tokenMinter = result.tokenMinter;
++        ).then(() => {
+             tokenMinterReadyResolve?.();
+         }).catch((err) => {
+             console.error("[ERROR] Failed to initialize PO token:", err);
+@@ -111,25 +137,13 @@ if (!innertubeClientOauthEnabled) {
+         config.jobs.youtube_session.frequency,
+         { backoffSchedule: [5_000, 15_000, 60_000, 180_000] },
+         async () => {
+-            if (innertubeClientJobPoTokenEnabled) {
+-                try {
+-                    ({ innertubeClient, tokenMinter } = await poTokenGenerate(
+-                        config,
+-                        metrics,
+-                    ));
+-                } catch (err) {
++            try {
++                await sessionRecovery.refresh();
++            } catch (err) {
++                if (innertubeClientJobPoTokenEnabled) {
+                     metrics?.potokenGenerationFailure.inc();
+-                    throw err;
+                 }
+-            } else {
+-                innertubeClient = await Innertube.create({
+-                    enable_session_cache: false,
+-                    fetch: getFetchClient(config),
+-                    retrieve_player: innertubeClientFetchPlayer,
+-                    user_agent: USER_AGENT,
+-                    cookie: innertubeClientCookies || undefined,
+-                    player_id: PLAYER_ID,
+-                });
++                throw err;
+             }
+         },
+     );
+@@ -158,8 +172,16 @@ if (!innertubeClientOauthEnabled) {
+ }
+ 
+ companionApp.use("*", async (c, next) => {
+-    c.set("innertubeClient", innertubeClient);
+-    c.set("tokenMinter", tokenMinter);
++    const session = sessionRecovery.current;
++    c.set("innertubeClient", session.innertubeClient);
++    c.set("tokenMinter", session.tokenMinter);
++    c.set(
++        "sessionRecovery",
++        !innertubeClientOauthEnabled &&
++            config.networking.connection_recovery_attempts > 0
++            ? sessionRecovery
++            : undefined,
++    );
+     c.set("config", config);
+     c.set("metrics", metrics);
+     await next();
+diff --git a/src/routes/invidious_routes/captions.ts b/src/routes/invidious_routes/captions.ts
+index 88d387c..bb80ac0 100644
+--- a/src/routes/invidious_routes/captions.ts
++++ b/src/routes/invidious_routes/captions.ts
+@@ -10,6 +10,7 @@ import { handleTranscripts } from "../../lib/helpers/youtubeTranscriptsHandling.
+ import { HTTPException } from "hono/http-exception";
+ import { validateVideoId } from "../../lib/helpers/validateVideoId.ts";
+ import { TOKEN_MINTER_NOT_READY_MESSAGE } from "../../constants.ts";
++import { sessionRecoveryMessage } from "../../lib/helpers/youtubeSessionRecovery.ts";
+ 
+ interface AvailableCaption {
+     label: string;
+@@ -66,10 +67,16 @@ captionsHandler.get("/:videoId", async (c) => {
+         config,
+         metrics,
+         tokenMinter: tokenMinter!,
++        sessionRecovery: c.get("sessionRecovery"),
++        signal: c.req.raw.signal,
+     });
+ 
++    const recoveryMessage = sessionRecoveryMessage(youtubePlayerResponseJson);
++    if (recoveryMessage) {
++        throw new HTTPException(503, { message: recoveryMessage });
++    }
+     const videoInfo = youtubeVideoInfo(
+-        innertubeClient,
++        c.get("sessionRecovery")?.current.innertubeClient ?? innertubeClient,
+         youtubePlayerResponseJson,
+     );
+ 
+diff --git a/src/routes/invidious_routes/dashManifest.ts b/src/routes/invidious_routes/dashManifest.ts
+index 3ac9401..71edbb3 100644
+--- a/src/routes/invidious_routes/dashManifest.ts
++++ b/src/routes/invidious_routes/dashManifest.ts
+@@ -9,8 +9,10 @@ import { HTTPException } from "hono/http-exception";
+ import { encryptQuery } from "../../lib/helpers/encryptQuery.ts";
+ import { validateVideoId } from "../../lib/helpers/validateVideoId.ts";
+ import { TOKEN_MINTER_NOT_READY_MESSAGE } from "../../constants.ts";
++import { sessionRecoveryMessage } from "../../lib/helpers/youtubeSessionRecovery.ts";
++import type { HonoVariables } from "../../lib/types/HonoVariables.ts";
+ 
+-const dashManifest = new Hono();
++const dashManifest = new Hono<{ Variables: HonoVariables }>();
+ 
+ dashManifest.get("/:videoId", async (c) => {
+     const { videoId } = c.req.param();
+@@ -53,9 +55,15 @@ dashManifest.get("/:videoId", async (c) => {
+         config,
+         tokenMinter: tokenMinter!,
+         metrics,
++        sessionRecovery: c.get("sessionRecovery"),
++        signal: c.req.raw.signal,
+     });
++    const recoveryMessage = sessionRecoveryMessage(youtubePlayerResponseJson);
++    if (recoveryMessage) {
++        throw new HTTPException(503, { message: recoveryMessage });
++    }
+     const videoInfo = youtubeVideoInfo(
+-        innertubeClient,
++        c.get("sessionRecovery")?.current.innertubeClient ?? innertubeClient,
+         youtubePlayerResponseJson,
+     );
+ 
+diff --git a/src/routes/invidious_routes/latestVersion.ts b/src/routes/invidious_routes/latestVersion.ts
+index 9101ae4..076fa2c 100644
+--- a/src/routes/invidious_routes/latestVersion.ts
++++ b/src/routes/invidious_routes/latestVersion.ts
+@@ -8,8 +8,10 @@ import { verifyRequest } from "../../lib/helpers/verifyRequest.ts";
+ import { encryptQuery } from "../../lib/helpers/encryptQuery.ts";
+ import { validateVideoId } from "../../lib/helpers/validateVideoId.ts";
+ import { TOKEN_MINTER_NOT_READY_MESSAGE } from "../../constants.ts";
++import { sessionRecoveryMessage } from "../../lib/helpers/youtubeSessionRecovery.ts";
++import type { HonoVariables } from "../../lib/types/HonoVariables.ts";
+ 
+-const latestVersion = new Hono();
++const latestVersion = new Hono<{ Variables: HonoVariables }>();
+ 
+ latestVersion.get("/", async (c) => {
+     const { check, itag, id, local, title } = c.req.query();
+@@ -57,9 +59,15 @@ latestVersion.get("/", async (c) => {
+         config,
+         tokenMinter: tokenMinter!,
+         metrics,
++        sessionRecovery: c.get("sessionRecovery"),
++        signal: c.req.raw.signal,
+     });
++    const recoveryMessage = sessionRecoveryMessage(youtubePlayerResponseJson);
++    if (recoveryMessage) {
++        throw new HTTPException(503, { message: recoveryMessage });
++    }
+     const videoInfo = youtubeVideoInfo(
+-        innertubeClient,
++        c.get("sessionRecovery")?.current.innertubeClient ?? innertubeClient,
+         youtubePlayerResponseJson,
+     );
+ 
 diff --git a/src/routes/videoPlaybackProxy.ts b/src/routes/videoPlaybackProxy.ts
 index a6b3a84..bfcf7d9 100644
 --- a/src/routes/videoPlaybackProxy.ts
@@ -658,12 +1313,36 @@ index a6b3a84..bfcf7d9 100644
          status: responseStatus,
          statusText: headResponse.statusText,
          headers: headersForResponse,
+diff --git a/src/routes/youtube_api_routes/player.ts b/src/routes/youtube_api_routes/player.ts
+index f416fa6..420e311 100644
+--- a/src/routes/youtube_api_routes/player.ts
++++ b/src/routes/youtube_api_routes/player.ts
+@@ -3,8 +3,9 @@ import { youtubePlayerParsing } from "../../lib/helpers/youtubePlayerHandling.ts
+ import { HTTPException } from "hono/http-exception";
+ import { validateVideoId } from "../../lib/helpers/validateVideoId.ts";
+ import { TOKEN_MINTER_NOT_READY_MESSAGE } from "../../constants.ts";
++import type { HonoVariables } from "../../lib/types/HonoVariables.ts";
+ 
+-const player = new Hono();
++const player = new Hono<{ Variables: HonoVariables }>();
+ 
+ player.post("/player", async (c) => {
+     const jsonReq = await c.req.json();
+@@ -46,6 +47,8 @@ player.post("/player", async (c) => {
+                 config,
+                 tokenMinter: tokenMinter!,
+                 metrics,
++                sessionRecovery: c.get("sessionRecovery"),
++                signal: c.req.raw.signal,
+             }),
+         );
+     }
 diff --git a/src/tests/connectionRotation_test.ts b/src/tests/connectionRotation_test.ts
 new file mode 100644
-index 0000000..954cfdd
+index 0000000..3c88365
 --- /dev/null
 +++ b/src/tests/connectionRotation_test.ts
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,552 @@
 +import { assertEquals, assertRejects } from "./deps.ts";
 +import { Hono } from "hono";
 +import type { HonoVariables } from "../lib/types/HonoVariables.ts";
@@ -1195,6 +1874,461 @@ index 0000000..954cfdd
 +    } finally {
 +        fetchClient.close();
 +        await server.shutdown();
++    }
++});
++
++Deno.test("explicit session pool retirement lets active responses drain", async () => {
++    let signal: AbortSignal | undefined;
++    await withNetworkMock((_input, init) => {
++        signal = init!.signal!;
++        return Promise.resolve(new Response(new Uint8Array([1, 2])));
++    }, async (clients) => {
++        const fetchClient = getFetchClient(recoveryConfig());
++        const response = await fetchClient("https://example.com");
++        fetchClient.retire();
++        assertEquals(clients[0].closes, 0);
++        assertEquals(signal!.aborted, false);
++        assertEquals(
++            new Uint8Array(await response.arrayBuffer()),
++            new Uint8Array([1, 2]),
++        );
++        assertEquals(clients[0].closes, 1);
++    });
++});
+diff --git a/src/tests/youtubeSessionRecovery_test.ts b/src/tests/youtubeSessionRecovery_test.ts
+new file mode 100644
+index 0000000..53dc363
+--- /dev/null
++++ b/src/tests/youtubeSessionRecovery_test.ts
+@@ -0,0 +1,430 @@
++import { assertEquals, assertRejects } from "./deps.ts";
++import type { ApiResponse, Innertube } from "youtubei.js";
++import { Hono } from "hono";
++import type { HonoVariables } from "../lib/types/HonoVariables.ts";
++import { ConfigSchema } from "../lib/helpers/config.ts";
++import player from "../routes/youtube_api_routes/player.ts";
++import latestVersion from "../routes/invidious_routes/latestVersion.ts";
++import dashManifest from "../routes/invidious_routes/dashManifest.ts";
++import captions from "../routes/invidious_routes/captions.ts";
++import {
++    isTemporaryPlayerFailure,
++    type YoutubeSession,
++    YoutubeSessionRecovery,
++} from "../lib/helpers/youtubeSessionRecovery.ts";
++
++function session(name: string): YoutubeSession {
++    return { innertubeClient: { name } as unknown as Innertube };
++}
++
++function playerResponse(
++    reason = "This content isn't available, try again later.",
++    status = "ERROR",
++): ApiResponse {
++    return {
++        success: true,
++        status_code: 200,
++        data: { playabilityStatus: { status, reason } },
++    };
++}
++
++Deno.test("temporary player failure detection excludes genuine availability errors", () => {
++    assertEquals(isTemporaryPlayerFailure(playerResponse()), true);
++    assertEquals(
++        isTemporaryPlayerFailure(
++            playerResponse(
++                "This content isn\u2019t available, try again later.",
++                "UNPLAYABLE",
++            ),
++        ),
++        true,
++    );
++    for (
++        const reason of [
++            "This video is private",
++            "Video unavailable",
++            "This video has been removed",
++            "Not available in your country",
++        ]
++    ) {
++        assertEquals(isTemporaryPlayerFailure(playerResponse(reason)), false);
++    }
++    assertEquals(
++        isTemporaryPlayerFailure(playerResponse(undefined, "LOGIN_REQUIRED")),
++        false,
++    );
++});
++
++Deno.test("temporary player failure detection reads renderer text runs", () => {
++    const response = playerResponse();
++    response.data.playabilityStatus = {
++        status: "ERROR",
++        errorScreen: {
++            playerErrorMessageRenderer: {
++                subreason: {
++                    runs: [{ text: "This content isn't available, " }, {
++                        text: "try again later.",
++                    }],
++                },
++            },
++        },
++    };
++    assertEquals(isTemporaryPlayerFailure(response), true);
++    response.data.playabilityStatus = {
++        status: "ERROR",
++        reason: "This content isn't available.",
++        errorScreen: {
++            playerErrorMessageRenderer: {
++                subreason: { simpleText: "Try again later." },
++            },
++        },
++    };
++    assertEquals(isTemporaryPlayerFailure(response), true);
++});
++
++Deno.test("player recovery rotates the failing API pool and retries the new session", async () => {
++    const previous = session("old");
++    const replacement = session("new");
++    let rotations = 0;
++    let retirements = 0;
++    previous.rotate = () => rotations++;
++    previous.retire = () => retirements++;
++    const recovery = new YoutubeSessionRecovery(
++        previous,
++        () => Promise.resolve(replacement),
++        { attempts: 2, timeoutMs: 1000 },
++    );
++    const seen: YoutubeSession[] = [];
++    const response = await recovery.player((active) => {
++        seen.push(active);
++        return Promise.resolve(
++            active === previous ? playerResponse() : playerResponse("", "OK"),
++        );
++    });
++    assertEquals(response.data.playabilityStatus?.status, "OK");
++    assertEquals(seen, [previous, replacement]);
++    assertEquals(rotations, 1);
++    assertEquals(retirements, 1);
++});
++
++Deno.test("concurrent player failures share a single refresh", async () => {
++    const previous = session("old");
++    const replacement = session("new");
++    const generated = Promise.withResolvers<YoutubeSession>();
++    const started = Promise.withResolvers<void>();
++    let generations = 0;
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        started.resolve();
++        return generated.promise;
++    }, { attempts: 2, timeoutMs: 1000 });
++    const request = (active: YoutubeSession) =>
++        Promise.resolve(
++            active === previous ? playerResponse() : playerResponse("", "OK"),
++        );
++    const first = recovery.player(request);
++    const second = recovery.player(request);
++    await started.promise;
++    assertEquals(generations, 1);
++    generated.resolve(replacement);
++    for (const response of await Promise.all([first, second])) {
++        assertEquals(response.data.playabilityStatus?.status, "OK");
++    }
++    assertEquals(generations, 1);
++});
++
++Deno.test("failed session refresh returns a useful error and observes cooldown", async () => {
++    let generations = 0;
++    const recovery = new YoutubeSessionRecovery(session("old"), () => {
++        generations++;
++        return Promise.reject(new Error("Token generation failed"));
++    }, { attempts: 2, timeoutMs: 1000 });
++    for (let request = 0; request < 2; request++) {
++        const response = await recovery.player(() =>
++            Promise.resolve(playerResponse())
++        );
++        assertEquals(response.data.playabilityStatus?.status, "ERROR");
++        assertEquals(
++            response.data.playabilityStatus?.reason?.includes(
++                "Companion could not restore",
++            ),
++            true,
++        );
++        assertEquals(
++            response.data.playabilityStatus?.errorScreen
++                ?.playerErrorMessageRenderer.reason.simpleText,
++            response.data.playabilityStatus?.reason,
++        );
++    }
++    assertEquals(generations, 1);
++});
++
++Deno.test("player timeout does not cancel the shared background refresh", async () => {
++    const generated = Promise.withResolvers<YoutubeSession>();
++    const recovery = new YoutubeSessionRecovery(
++        session("old"),
++        () => generated.promise,
++        { attempts: 2, timeoutMs: 5 },
++    );
++    const response = await recovery.player(() =>
++        Promise.resolve(playerResponse())
++    );
++    assertEquals(
++        response.data.playabilityStatus?.reason?.includes(
++            "Companion is refreshing",
++        ),
++        true,
++    );
++    const pending = recovery.refresh();
++    const replacement = session("new");
++    generated.resolve(replacement);
++    assertEquals(await pending, replacement);
++    assertEquals(recovery.current, replacement);
++});
++
++Deno.test("disconnecting a player stops waiting without cancelling another waiter", async () => {
++    const previous = session("old");
++    const generated = Promise.withResolvers<YoutubeSession>();
++    const started = Promise.withResolvers<void>();
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        started.resolve();
++        return generated.promise;
++    }, { attempts: 2, timeoutMs: 1000 });
++    const request = (active: YoutubeSession) =>
++        Promise.resolve(
++            active === previous ? playerResponse() : playerResponse("", "OK"),
++        );
++    const controller = new AbortController();
++    const disconnected = recovery.player(request, controller.signal);
++    const connected = recovery.player(request);
++    await started.promise;
++    controller.abort();
++    await assertRejects(() => disconnected, DOMException);
++    generated.resolve(session("new"));
++    assertEquals((await connected).data.playabilityStatus?.status, "OK");
++});
++
++Deno.test("player requests join a scheduled refresh before using a session", async () => {
++    const generated = Promise.withResolvers<YoutubeSession>();
++    const replacement = session("new");
++    const recovery = new YoutubeSessionRecovery(
++        session("old"),
++        () => generated.promise,
++        { attempts: 2, timeoutMs: 1000 },
++    );
++    const scheduled = recovery.refresh();
++    const seen: YoutubeSession[] = [];
++    const request = recovery.player((active) => {
++        seen.push(active);
++        return Promise.resolve(playerResponse("", "OK"));
++    });
++    assertEquals(seen.length, 0);
++    generated.resolve(replacement);
++    await scheduled;
++    assertEquals((await request).data.playabilityStatus?.status, "OK");
++    assertEquals(seen, [replacement]);
++});
++
++Deno.test("unchanged availability failures do not cause repeated session generation", async () => {
++    let generations = 0;
++    let requests = 0;
++    const recovery = new YoutubeSessionRecovery(session("old"), () => {
++        generations++;
++        return Promise.resolve(session("new"));
++    }, { attempts: 2, timeoutMs: 1000 });
++    const response = await recovery.player(() => {
++        requests++;
++        return Promise.resolve(playerResponse());
++    });
++    assertEquals(response.data.playabilityStatus?.status, "ERROR");
++    assertEquals(generations, 1);
++    assertEquals(requests, 2);
++});
++
++Deno.test("private videos and disabled recovery preserve the original response", async () => {
++    for (const attempts of [0, 2]) {
++        let generations = 0;
++        const recovery = new YoutubeSessionRecovery(session("old"), () => {
++            generations++;
++            return Promise.resolve(session("new"));
++        }, { attempts, timeoutMs: 1000 });
++        const original = playerResponse(
++            attempts ? "This video is private" : undefined,
++        );
++        assertEquals(
++            await recovery.player(() => Promise.resolve(original)),
++            original,
++        );
++        assertEquals(generations, 0);
++    }
++});
++
++Deno.test("a late failure from a superseded session reuses the already refreshed session", async () => {
++    const previous = session("old");
++    const replacement = session("new");
++    const delayed = Promise.withResolvers<ApiResponse>();
++    let generations = 0;
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        return Promise.resolve(replacement);
++    }, { attempts: 2, timeoutMs: 1000 });
++    const request = recovery.player((active) =>
++        active === previous
++            ? delayed.promise
++            : Promise.resolve(playerResponse("", "OK"))
++    );
++    await recovery.refresh(previous.innertubeClient);
++    delayed.resolve(playerResponse());
++    assertEquals((await request).data.playabilityStatus?.status, "OK");
++    assertEquals(generations, 1);
++});
++
++Deno.test("player recovery endpoints hold requests and provide useful fallback responses", async (test) => {
++    const kv = await Deno.openKv(":memory:");
++    const originalMkdir = Deno.mkdir;
++    const originalOpenKv = Object.getOwnPropertyDescriptor(Deno, "openKv")!;
++    Deno.mkdir = () => Promise.resolve();
++    Object.defineProperty(Deno, "openKv", {
++        configurable: true,
++        value: () => Promise.resolve(kv),
++    });
++    const config = ConfigSchema.parse({
++        server: { secret_key: "testSecretKey123", verify_requests: false },
++        cache: { enabled: false },
++        networking: { connection_recovery_attempts: 2 },
++    });
++    const apiSession = (
++        response: ApiResponse,
++        token: string,
++    ): YoutubeSession => ({
++        innertubeClient: {
++            session: {},
++            actions: {
++                execute: (
++                    _path: string,
++                    options: {
++                        serviceIntegrityDimensions: { poToken: string };
++                    },
++                ) => {
++                    assertEquals(
++                        options.serviceIntegrityDimensions.poToken,
++                        token,
++                    );
++                    return Promise.resolve(response);
++                },
++            },
++        } as unknown as Innertube,
++        tokenMinter: () => Promise.resolve(token),
++    });
++    const makeApp = (recovery: YoutubeSessionRecovery) => {
++        const app = new Hono<{ Variables: HonoVariables }>();
++        app.use("*", async (context, next) => {
++            context.set("config", config);
++            context.set("innertubeClient", recovery.current.innertubeClient);
++            context.set("tokenMinter", recovery.current.tokenMinter);
++            context.set("metrics", undefined);
++            context.set("sessionRecovery", recovery);
++            await next();
++        });
++        app.route("/youtubei/v1", player);
++        app.route("/latest_version", latestVersion);
++        app.route("/api/manifest/dash/id", dashManifest);
++        app.route("/api/v1/captions", captions);
++        return app;
++    };
++    const playerRequest = async (app: ReturnType<typeof makeApp>) =>
++        await app.request("/youtubei/v1/player", {
++            method: "POST",
++            headers: { "content-type": "application/json" },
++            body: JSON.stringify({ videoId: "jNQXAC9IVRw" }),
++        });
++    try {
++        await test.step("player response waits and retries using the replacement session", async () => {
++            const generated = Promise.withResolvers<YoutubeSession>();
++            const started = Promise.withResolvers<void>();
++            const replacement = apiSession(
++                playerResponse("", "OK"),
++                "fresh-token",
++            );
++            const recovery = new YoutubeSessionRecovery(
++                apiSession(playerResponse(), "old-token"),
++                () => {
++                    started.resolve();
++                    return generated.promise;
++                },
++                { attempts: 2, timeoutMs: 1000 },
++            );
++            let served = false;
++            const pending = playerRequest(makeApp(recovery)).then(
++                (response) => {
++                    served = true;
++                    return response;
++                },
++            );
++            await started.promise;
++            assertEquals(served, false);
++            generated.resolve(replacement);
++            const response = await pending;
++            assertEquals(response.status, 200);
++            assertEquals(
++                (await response.json()).playabilityStatus.status,
++                "OK",
++            );
++        });
++        await test.step("timed-out refresh returns player-shaped explanatory text", async () => {
++            const generated = Promise.withResolvers<YoutubeSession>();
++            const recovery = new YoutubeSessionRecovery(
++                apiSession(playerResponse(), "old-token"),
++                () => generated.promise,
++                { attempts: 2, timeoutMs: 5 },
++            );
++            const response = await playerRequest(makeApp(recovery));
++            assertEquals(response.status, 200);
++            const data = await response.json();
++            assertEquals(data.playabilityStatus.status, "ERROR");
++            assertEquals(
++                data.playabilityStatus.reason.includes(
++                    "Companion is refreshing",
++                ),
++                true,
++            );
++            assertEquals(
++                data.playabilityStatus.errorScreen.playerErrorMessageRenderer
++                    .reason.simpleText,
++                data.playabilityStatus.reason,
++            );
++            const pending = recovery.refresh();
++            generated.resolve(
++                apiSession(playerResponse("", "OK"), "fresh-token"),
++            );
++            await pending;
++        });
++        for (
++            const path of [
++                "/latest_version?id=jNQXAC9IVRw&itag=18",
++                "/api/manifest/dash/id/jNQXAC9IVRw",
++                "/api/v1/captions/jNQXAC9IVRw",
++            ]
++        ) {
++            await test.step(`${path} returns readable 503 after failed refresh`, async () => {
++                const recovery = new YoutubeSessionRecovery(
++                    apiSession(playerResponse(), "old-token"),
++                    () => Promise.reject(new Error("No valid token")),
++                    { attempts: 2, timeoutMs: 1000 },
++                );
++                const response = await makeApp(recovery).request(path);
++                assertEquals(response.status, 503);
++                assertEquals(
++                    (await response.text()).includes(
++                        "Companion could not restore",
++                    ),
++                    true,
++                );
++            });
++        }
++    } finally {
++        Deno.mkdir = originalMkdir;
++        Object.defineProperty(Deno, "openKv", originalOpenKv);
++        kv.close();
 +    }
 +});
 -- 

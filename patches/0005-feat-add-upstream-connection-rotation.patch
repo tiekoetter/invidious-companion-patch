@@ -32,23 +32,29 @@ return explanatory player errors or readable 503 responses on exhaustion.
 
 Add refresh cooldowns, stale-session handling, graceful API pool retirement,
 and endpoint tests without routing token validation back into recovery.
+
+Distinguish intentional pool-rotation aborts from caller cancellation and
+recover requests already in flight when the shared API pool is replaced.
+Publish the shared refresh before aborting connections so affected requests
+join it instead of escaping as server errors. Test concurrent endpoints,
+refresh failure and timeout, cancellation, and real HTTP abort propagation.
 ---
  config/config.example.toml                   |  12 +
  src/lib/helpers/config.ts                    |  11 +
- src/lib/helpers/getFetchClient.ts            | 266 +++++++++++--
- src/lib/helpers/youtubePlayerHandling.ts     |  43 ++-
- src/lib/helpers/youtubeSessionRecovery.ts    | 185 +++++++++
+ src/lib/helpers/getFetchClient.ts            | 274 +++++++++--
+ src/lib/helpers/youtubePlayerHandling.ts     |  43 +-
+ src/lib/helpers/youtubeSessionRecovery.ts    | 198 ++++++++
  src/lib/jobs/potoken.ts                      |  18 +-
  src/lib/types/HonoVariables.ts               |   2 +
- src/main.ts                                  |  86 +++--
+ src/main.ts                                  |  86 ++--
  src/routes/invidious_routes/captions.ts      |   9 +-
  src/routes/invidious_routes/dashManifest.ts  |  12 +-
  src/routes/invidious_routes/latestVersion.ts |  12 +-
- src/routes/videoPlaybackProxy.ts             | 198 +++++++---
+ src/routes/videoPlaybackProxy.ts             | 198 ++++++--
  src/routes/youtube_api_routes/player.ts      |   5 +-
- src/tests/connectionRotation_test.ts         | 552 +++++++++++++++++++++++++++
- src/tests/youtubeSessionRecovery_test.ts     | 430 +++++++++++++++++++++
- 15 files changed, 1698 insertions(+), 143 deletions(-)
+ src/tests/connectionRotation_test.ts         | 612 +++++++++++++++++++++++++
+ src/tests/youtubeSessionRecovery_test.ts     | 654 +++++++++++++++++++++++++++
+ 15 files changed, 2003 insertions(+), 143 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
 index 54579df..545f296 100644
@@ -96,14 +102,20 @@ index 96b53b1..a4713b4 100644
              timeout_ms: z.number().default(
                  Number(Deno.env.get("NETWORKING_FETCH_TIMEOUT_MS")) || 30_000,
 diff --git a/src/lib/helpers/getFetchClient.ts b/src/lib/helpers/getFetchClient.ts
-index bbf70ee..559bea2 100644
+index bbf70ee..422ae2d 100644
 --- a/src/lib/helpers/getFetchClient.ts
 +++ b/src/lib/helpers/getFetchClient.ts
-@@ -8,14 +8,29 @@ type FetchInitParameterWithClient =
+@@ -8,14 +8,35 @@ type FetchInitParameterWithClient =
      | RequestInit & { client: Deno.HttpClient };
  type FetchReturn = ReturnType<typeof fetch>;
  
 -export const getFetchClient = (config: Config): {
++export class UpstreamPoolRotationError extends DOMException {
++    constructor() {
++        super("The upstream connection pool was rotated", "AbortError");
++    }
++}
++
 +export type RotatingFetchClient = {
      (
          input: FetchInputParameter,
@@ -131,7 +143,7 @@ index bbf70ee..559bea2 100644
  
      const fetchMaxAttempts = config.networking.fetch?.retry?.times;
      const fetchInitialDebounce = config.networking.fetch?.retry
-@@ -29,23 +44,77 @@ export const getFetchClient = (config: Config): {
+@@ -29,23 +50,77 @@ export const getFetchClient = (config: Config): {
          jitter: 0,
      };
  
@@ -217,7 +229,7 @@ index bbf70ee..559bea2 100644
              } else {
                  const clientOptions: Deno.CreateHttpClientOptions = {};
                  if (proxyAddress) {
-@@ -57,25 +126,44 @@ export const getFetchClient = (config: Config): {
+@@ -57,25 +132,44 @@ export const getFetchClient = (config: Config): {
                  client = Deno.createHttpClient(clientOptions);
              }
  
@@ -276,7 +288,7 @@ index bbf70ee..559bea2 100644
                  return new Response(null, {
                      status: fetchRes.status,
                      headers: fetchRes.headers,
-@@ -85,17 +173,25 @@ export const getFetchClient = (config: Config): {
+@@ -85,17 +179,25 @@ export const getFetchClient = (config: Config): {
              const reader = originalBody.getReader();
              const wrappedBody = new ReadableStream({
                  async pull(controller) {
@@ -311,7 +323,7 @@ index bbf70ee..559bea2 100644
                  },
              });
  
-@@ -104,10 +200,100 @@ export const getFetchClient = (config: Config): {
+@@ -104,10 +206,102 @@ export const getFetchClient = (config: Config): {
                  headers: fetchRes.headers,
              });
          };
@@ -339,7 +351,9 @@ index bbf70ee..559bea2 100644
 +                    const retiredClient = reusableClient;
 +                    reusableClient = undefined;
 +                    retiredClient.retired = true;
-+                    retiredClient.controller.abort();
++                    retiredClient.controller.abort(
++                        new UpstreamPoolRotationError(),
++                    );
 +                    closeGeneration(retiredClient);
 +                    reusableClient = createReusableClient();
 +                }
@@ -414,7 +428,7 @@ index bbf70ee..559bea2 100644
  };
  
  function fetchShim(
-@@ -121,11 +307,13 @@ function fetchShim(
+@@ -121,11 +315,13 @@ function fetchShim(
  
      const callFetch = () =>
          fetch(input, {
@@ -524,14 +538,15 @@ index 3c6df51..af7e84b 100644
                      let index = 0;
 diff --git a/src/lib/helpers/youtubeSessionRecovery.ts b/src/lib/helpers/youtubeSessionRecovery.ts
 new file mode 100644
-index 0000000..f8bdf92
+index 0000000..cc41efe
 --- /dev/null
 +++ b/src/lib/helpers/youtubeSessionRecovery.ts
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,198 @@
 +import { abortable } from "@std/async";
 +import type { ApiResponse, Innertube } from "youtubei.js";
 +import { z } from "zod";
 +import type { TokenMinter } from "../jobs/potoken.ts";
++import { UpstreamPoolRotationError } from "./getFetchClient.ts";
 +
 +export type YoutubeSession = {
 +    innertubeClient: Innertube;
@@ -630,13 +645,17 @@ index 0000000..f8bdf92
 +                );
 +            }
 +            this.#lastRecoveryAt = Date.now();
-+            this.#current.rotate?.();
-+            console.warn(
-+                "[WARN] Refreshing YouTube session after a temporary player failure",
-+            );
 +        }
 +        const previous = this.#current;
-+        this.#refreshing = Promise.resolve().then(() => this.createSession())
++        this.#refreshing = Promise.resolve().then(() => {
++            if (failedClient) {
++                previous.rotate?.();
++                console.warn(
++                    "[WARN] Refreshing YouTube session after a temporary player failure",
++                );
++            }
++            return this.createSession();
++        })
 +            .then((session) => {
 +                this.#current = session;
 +                previous.retire?.();
@@ -673,9 +692,17 @@ index 0000000..f8bdf92
 +                return this.unavailable();
 +            }
 +        } else {
-+            response = await request(session);
++            try {
++                const pending = request(session);
++                response = callerSignal
++                    ? await abortable(pending, callerSignal)
++                    : await pending;
++            } catch (err) {
++                callerSignal?.throwIfAborted();
++                if (!(err instanceof UpstreamPoolRotationError)) throw err;
++            }
 +        }
-+        if (!isTemporaryPlayerFailure(response)) return response;
++        if (response && !isTemporaryPlayerFailure(response)) return response;
 +
 +        try {
 +            for (let attempt = 0; attempt < this.options.attempts; attempt++) {
@@ -1339,15 +1366,18 @@ index f416fa6..420e311 100644
      }
 diff --git a/src/tests/connectionRotation_test.ts b/src/tests/connectionRotation_test.ts
 new file mode 100644
-index 0000000..3c88365
+index 0000000..f939f5b
 --- /dev/null
 +++ b/src/tests/connectionRotation_test.ts
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,612 @@
 +import { assertEquals, assertRejects } from "./deps.ts";
 +import { Hono } from "hono";
 +import type { HonoVariables } from "../lib/types/HonoVariables.ts";
 +import { ConfigSchema } from "../lib/helpers/config.ts";
-+import { getFetchClient } from "../lib/helpers/getFetchClient.ts";
++import {
++    getFetchClient,
++    UpstreamPoolRotationError,
++} from "../lib/helpers/getFetchClient.ts";
 +import videoPlaybackProxy from "../routes/videoPlaybackProxy.ts";
 +
 +function recoveryConfig(attempts = 2, timeout = 10_000) {
@@ -1895,17 +1925,78 @@ index 0000000..3c88365
 +        assertEquals(clients[0].closes, 1);
 +    });
 +});
++
++Deno.test("real HTTP requests preserve the pool-rotation abort marker", async () => {
++    const started = Promise.withResolvers<void>();
++    const delayed = Promise.withResolvers<Response>();
++    const server = Deno.serve({
++        hostname: "127.0.0.1",
++        port: 0,
++        onListen() {},
++    }, () => {
++        started.resolve();
++        return delayed.promise;
++    });
++    const fetchClient = getFetchClient(recoveryConfig());
++    try {
++        const request = fetchClient(`http://127.0.0.1:${server.addr.port}/`, {
++            method: "POST",
++        });
++        const aborted = assertRejects(() => request, UpstreamPoolRotationError);
++        await started.promise;
++        fetchClient.rotate();
++        await aborted;
++    } finally {
++        delayed.resolve(new Response(null));
++        fetchClient.close();
++        await server.shutdown();
++    }
++});
++
++Deno.test("pool-rotation aborts retain their marker during response body reads", async () => {
++    await withNetworkMock((_input, init) =>
++        Promise.resolve(
++            new Response(
++                new ReadableStream({
++                    start(controller) {
++                        init!.signal!.addEventListener("abort", () => {
++                            controller.error(init!.signal!.reason);
++                        }, { once: true });
++                    },
++                }),
++            ),
++        ), async () => {
++        const fetchClient = getFetchClient(recoveryConfig());
++        try {
++            const response = await fetchClient("https://example.com", {
++                method: "POST",
++            });
++            const aborted = assertRejects(
++                () => response.json(),
++                UpstreamPoolRotationError,
++            );
++            fetchClient.rotate();
++            await aborted;
++        } finally {
++            fetchClient.close();
++        }
++    });
++});
 diff --git a/src/tests/youtubeSessionRecovery_test.ts b/src/tests/youtubeSessionRecovery_test.ts
 new file mode 100644
-index 0000000..53dc363
+index 0000000..edcd41c
 --- /dev/null
 +++ b/src/tests/youtubeSessionRecovery_test.ts
-@@ -0,0 +1,430 @@
+@@ -0,0 +1,654 @@
 +import { assertEquals, assertRejects } from "./deps.ts";
 +import type { ApiResponse, Innertube } from "youtubei.js";
 +import { Hono } from "hono";
 +import type { HonoVariables } from "../lib/types/HonoVariables.ts";
 +import { ConfigSchema } from "../lib/helpers/config.ts";
++import {
++    getFetchClient,
++    UpstreamPoolRotationError,
++} from "../lib/helpers/getFetchClient.ts";
 +import player from "../routes/youtube_api_routes/player.ts";
 +import latestVersion from "../routes/invidious_routes/latestVersion.ts";
 +import dashManifest from "../routes/invidious_routes/dashManifest.ts";
@@ -2034,6 +2125,151 @@ index 0000000..53dc363
 +        assertEquals(response.data.playabilityStatus?.status, "OK");
 +    }
 +    assertEquals(generations, 1);
++});
++
++Deno.test("requests aborted by pool rotation wait for the same session refresh", async () => {
++    const previous = session("old");
++    const replacement = session("new");
++    const generated = Promise.withResolvers<YoutubeSession>();
++    const started = Promise.withResolvers<void>();
++    const interrupted = [
++        Promise.withResolvers<ApiResponse>(),
++        Promise.withResolvers<ApiResponse>(),
++    ];
++    let generations = 0;
++    let refreshPublished = false;
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        started.resolve();
++        return generated.promise;
++    }, { attempts: 2, timeoutMs: 1000 });
++    previous.rotate = () => {
++        refreshPublished = recovery.isRefreshing;
++        for (const pending of interrupted) {
++            pending.reject(new UpstreamPoolRotationError());
++        }
++    };
++    const waiting = interrupted.map((pending) =>
++        recovery.player((active) =>
++            active === previous
++                ? pending.promise
++                : Promise.resolve(playerResponse("", "OK"))
++        )
++    );
++    const triggering = recovery.player((active) =>
++        Promise.resolve(
++            active === previous ? playerResponse() : playerResponse("", "OK"),
++        )
++    );
++    const responses = Promise.all([...waiting, triggering]);
++    await started.promise;
++    generated.resolve(replacement);
++    for (const response of await responses) {
++        assertEquals(response.data.playabilityStatus?.status, "OK");
++    }
++    assertEquals(generations, 1);
++    assertEquals(refreshPublished, true);
++});
++
++Deno.test("rotation-aborted requests receive useful errors when the shared refresh fails", async () => {
++    const previous = session("old");
++    const interrupted = Promise.withResolvers<ApiResponse>();
++    let generations = 0;
++    previous.rotate = () => interrupted.reject(new UpstreamPoolRotationError());
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        return Promise.reject(new Error("No valid token"));
++    }, { attempts: 2, timeoutMs: 1000 });
++    const waiting = recovery.player(() => interrupted.promise);
++    const triggering = recovery.player(() => Promise.resolve(playerResponse()));
++    for (const response of await Promise.all([waiting, triggering])) {
++        assertEquals(response.data.playabilityStatus?.status, "ERROR");
++        assertEquals(
++            response.data.playabilityStatus?.reason?.includes(
++                "Companion could not restore",
++            ),
++            true,
++        );
++    }
++    assertEquals(generations, 1);
++});
++
++Deno.test("rotation-aborted requests time out without cancelling the shared refresh", async () => {
++    const previous = session("old");
++    const interrupted = Promise.withResolvers<ApiResponse>();
++    const generated = Promise.withResolvers<YoutubeSession>();
++    previous.rotate = () => interrupted.reject(new UpstreamPoolRotationError());
++    const recovery = new YoutubeSessionRecovery(
++        previous,
++        () => generated.promise,
++        { attempts: 2, timeoutMs: 5 },
++    );
++    const waiting = recovery.player(() => interrupted.promise);
++    const triggering = recovery.player(() => Promise.resolve(playerResponse()));
++    for (const response of await Promise.all([waiting, triggering])) {
++        assertEquals(
++            response.data.playabilityStatus?.reason?.includes(
++                "Companion is refreshing",
++            ),
++            true,
++        );
++    }
++    assertEquals(recovery.isRefreshing, true);
++    const pending = recovery.refresh();
++    generated.resolve(session("new"));
++    await pending;
++});
++
++Deno.test("client cancellation wins over a simultaneous pool rotation", async () => {
++    const previous = session("old");
++    const interrupted = Promise.withResolvers<ApiResponse>();
++    const controller = new AbortController();
++    const reason = new DOMException("Player disconnected", "AbortError");
++    previous.rotate = () => {
++        controller.abort(reason);
++        interrupted.reject(new UpstreamPoolRotationError());
++    };
++    let generations = 0;
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        return Promise.resolve(session("new"));
++    }, { attempts: 2, timeoutMs: 1000 });
++    const waiting = recovery.player(
++        () => interrupted.promise,
++        controller.signal,
++    );
++    const cancelled = assertRejects(
++        () => waiting,
++        DOMException,
++        "Player disconnected",
++    );
++    const response = await recovery.player((active) =>
++        Promise.resolve(
++            active === previous ? playerResponse() : playerResponse("", "OK"),
++        )
++    );
++    assertEquals(await cancelled === reason, true);
++    assertEquals(response.data.playabilityStatus?.status, "OK");
++    assertEquals(generations, 1);
++});
++
++Deno.test("unrelated upstream aborts are not mistaken for pool rotations", async () => {
++    let generations = 0;
++    const recovery = new YoutubeSessionRecovery(session("old"), () => {
++        generations++;
++        return Promise.resolve(session("new"));
++    }, { attempts: 2, timeoutMs: 1000 });
++    await assertRejects(
++        () =>
++            recovery.player(() =>
++                Promise.reject(
++                    new DOMException("Unrelated upstream abort", "AbortError"),
++                )
++            ),
++        DOMException,
++        "Unrelated upstream abort",
++    );
++    assertEquals(generations, 0);
 +});
 +
 +Deno.test("failed session refresh returns a useful error and observes cooldown", async () => {
@@ -2242,6 +2478,81 @@ index 0000000..53dc363
 +            body: JSON.stringify({ videoId: "jNQXAC9IVRw" }),
 +        });
 +    try {
++        await test.step("concurrent player endpoints survive actual shared-pool rotation", async () => {
++            const originalFetch = globalThis.fetch;
++            const fetchClient = getFetchClient(config);
++            const requestsStarted = Promise.withResolvers<void>();
++            const refreshStarted = Promise.withResolvers<void>();
++            const generated = Promise.withResolvers<YoutubeSession>();
++            let calls = 0;
++            let generations = 0;
++            globalThis.fetch = (_input, init) => {
++                if (++calls <= 2) {
++                    if (calls === 2) requestsStarted.resolve();
++                    return new Promise((_resolve, reject) => {
++                        init!.signal!.addEventListener(
++                            "abort",
++                            () => reject(init!.signal!.reason),
++                            { once: true },
++                        );
++                    });
++                }
++                return Promise.resolve(
++                    new Response(JSON.stringify(playerResponse().data)),
++                );
++            };
++            const previous: YoutubeSession = {
++                innertubeClient: {
++                    session: {},
++                    actions: {
++                        execute: async () => {
++                            const response = await fetchClient(
++                                "https://example.com/player",
++                                { method: "POST" },
++                            );
++                            return {
++                                success: true,
++                                status_code: response.status,
++                                data: await response.json(),
++                            };
++                        },
++                    },
++                } as unknown as Innertube,
++                tokenMinter: () => Promise.resolve("old-token"),
++                rotate: fetchClient.rotate,
++                retire: fetchClient.retire,
++            };
++            const recovery = new YoutubeSessionRecovery(previous, () => {
++                generations++;
++                refreshStarted.resolve();
++                return generated.promise;
++            }, { attempts: 2, timeoutMs: 1000 });
++            try {
++                const app = makeApp(recovery);
++                const waiting = Promise.all([
++                    playerRequest(app),
++                    playerRequest(app),
++                ]);
++                await requestsStarted.promise;
++                const triggering = playerRequest(app);
++                await refreshStarted.promise;
++                generated.resolve(
++                    apiSession(playerResponse("", "OK"), "fresh-token"),
++                );
++                for (const response of [...await waiting, await triggering]) {
++                    assertEquals(response.status, 200);
++                    assertEquals(
++                        (await response.json()).playabilityStatus.status,
++                        "OK",
++                    );
++                }
++                assertEquals(calls, 3);
++                assertEquals(generations, 1);
++            } finally {
++                fetchClient.close();
++                globalThis.fetch = originalFetch;
++            }
++        });
 +        await test.step("player response waits and retries using the replacement session", async () => {
 +            const generated = Promise.withResolvers<YoutubeSession>();
 +            const started = Promise.withResolvers<void>();

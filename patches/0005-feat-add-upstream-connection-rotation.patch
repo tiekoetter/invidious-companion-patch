@@ -38,10 +38,16 @@ recover requests already in flight when the shared API pool is replaced.
 Publish the shared refresh before aborting connections so affected requests
 join it instead of escaping as server errors. Test concurrent endpoints,
 refresh failure and timeout, cancellation, and real HTTP abort propagation.
+
+Avoid per-request deciphering-script compilation and its retained source
+allocations. Cache only the latest compiled player script, pass request
+values as data, and preserve fresh evaluation state and standalone context.
+Add tests for compilation reuse, source replacement, and decoding behavior.
 ---
  config/config.example.toml                   |  12 +
  src/lib/helpers/config.ts                    |  11 +
  src/lib/helpers/getFetchClient.ts            | 274 +++++++++--
+ src/lib/helpers/jsInterpreter.ts             |  31 +-
  src/lib/helpers/youtubePlayerHandling.ts     |  43 +-
  src/lib/helpers/youtubeSessionRecovery.ts    | 198 ++++++++
  src/lib/jobs/potoken.ts                      |  18 +-
@@ -53,8 +59,9 @@ refresh failure and timeout, cancellation, and real HTTP abort propagation.
  src/routes/videoPlaybackProxy.ts             | 198 ++++++--
  src/routes/youtube_api_routes/player.ts      |   5 +-
  src/tests/connectionRotation_test.ts         | 612 +++++++++++++++++++++++++
+ src/tests/jsInterpreter_test.ts              | 101 +++++
  src/tests/youtubeSessionRecovery_test.ts     | 654 +++++++++++++++++++++++++++
- 15 files changed, 2003 insertions(+), 143 deletions(-)
+ 17 files changed, 2129 insertions(+), 149 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
 index 54579df..545f296 100644
@@ -446,6 +453,58 @@ index bbf70ee..422ae2d 100644
          });
      // if retry enabled, call retry with the fetch shim, otherwise pass the fetch shim back directly
      return fetchRetry ? retry(callFetch, retryOptions) : callFetch();
+diff --git a/src/lib/helpers/jsInterpreter.ts b/src/lib/helpers/jsInterpreter.ts
+index 524ac3c..c70b81e 100644
+--- a/src/lib/helpers/jsInterpreter.ts
++++ b/src/lib/helpers/jsInterpreter.ts
+@@ -1,22 +1,41 @@
+ import { Platform, Types } from "youtubei.js";
+ 
++type DecipherFunctions = {
++    nFunction: (value: string) => Types.VMPrimative;
++    sigFunction: (value: string) => Types.VMPrimative;
++};
++
++let compiledInterpreter: {
++    source: string;
++    evaluate: () => DecipherFunctions;
++} | undefined;
++
+ // https://ytjs.dev/guide/getting-started.html#providing-a-custom-javascript-interpreter
+ // deno-lint-ignore require-await
+ export const jsInterpreter = Platform.shim.eval = async (
+     data: Types.BuildScriptResult,
+     env: Record<string, Types.VMPrimative>,
+ ) => {
+-    const properties = [];
++    if (compiledInterpreter?.source !== data.output) {
++        compiledInterpreter = {
++            source: data.output,
++            evaluate: new Function(
++                `${data.output}\nreturn exportedVars;`,
++            ) as () => DecipherFunctions,
++        };
++    }
++
++    const { evaluate } = compiledInterpreter;
++    const exportedVars = evaluate();
++    const result: Record<string, Types.VMPrimative> = {};
+ 
+     if (env.n) {
+-        properties.push(`n: exportedVars.nFunction("${env.n}")`);
++        result.n = exportedVars.nFunction(String(env.n));
+     }
+ 
+     if (env.sig) {
+-        properties.push(`sig: exportedVars.sigFunction("${env.sig}")`);
++        result.sig = exportedVars.sigFunction(String(env.sig));
+     }
+ 
+-    const code = `${data.output}\nreturn { ${properties.join(", ")} }`;
+-
+-    return new Function(code)();
++    return result;
+ };
 diff --git a/src/lib/helpers/youtubePlayerHandling.ts b/src/lib/helpers/youtubePlayerHandling.ts
 index 3c6df51..af7e84b 100644
 --- a/src/lib/helpers/youtubePlayerHandling.ts
@@ -1981,6 +2040,113 @@ index 0000000..f939f5b
 +            fetchClient.close();
 +        }
 +    });
++});
+diff --git a/src/tests/jsInterpreter_test.ts b/src/tests/jsInterpreter_test.ts
+new file mode 100644
+index 0000000..3d3d27b
+--- /dev/null
++++ b/src/tests/jsInterpreter_test.ts
+@@ -0,0 +1,101 @@
++import { assertEquals } from "./deps.ts";
++import { jsInterpreter } from "../lib/helpers/jsInterpreter.ts";
++
++function script(output: string): Parameters<typeof jsInterpreter>[0] {
++    return { output } as Parameters<typeof jsInterpreter>[0];
++}
++
++Deno.test("interpreter compiles a shared script once across different request values", async () => {
++    const originalFunction = globalThis.Function;
++    let compilations = 0;
++    globalThis.Function = new Proxy(originalFunction, {
++        construct(target, args) {
++            compilations++;
++            return Reflect.construct(target, args);
++        },
++    });
++    try {
++        const data = script(`const exportedVars = {
++            nFunction: (value) => "n:" + value,
++            sigFunction: (value) => "sig:" + value,
++        };`);
++        for (let index = 0; index < 1000; index++) {
++            const value = String(index);
++            assertEquals(await jsInterpreter(data, { n: value, sig: value }), {
++                n: `n:${value}`,
++                sig: `sig:${value}`,
++            });
++        }
++        assertEquals(compilations, 1);
++    } finally {
++        globalThis.Function = originalFunction;
++    }
++});
++
++Deno.test("interpreter treats request values as data rather than JavaScript source", async () => {
++    const data = script(`const exportedVars = {
++        nFunction: (value) => value,
++        sigFunction: (value) => value.split("").reverse().join(""),
++    };`);
++    const value = 'quotes" backslash\\ newline\n';
++    assertEquals(await jsInterpreter(data, { n: value, sig: value }), {
++        n: value,
++        sig: value.split("").reverse().join(""),
++    });
++});
++
++Deno.test("interpreter preserves optional fields and string conversion", async () => {
++    const data = script(`const exportedVars = {
++        nFunction: (value) => typeof value + ":" + value,
++        sigFunction: (value) => typeof value + ":" + value,
++    };`);
++    assertEquals(await jsInterpreter(data, {}), {});
++    assertEquals(await jsInterpreter(data, { n: "", sig: false }), {});
++    assertEquals(await jsInterpreter(data, { n: 42, sig: true }), {
++        n: "string:42",
++        sig: "string:true",
++    });
++});
++
++Deno.test("interpreter evaluates fresh script state on each call", async () => {
++    const data = script(`let calls = 0;
++        const exportedVars = { nFunction: (value) => ++calls + ":" + value };`);
++    assertEquals(await jsInterpreter(data, { n: "first" }), { n: "1:first" });
++    assertEquals(await jsInterpreter(data, { n: "second" }), { n: "1:second" });
++});
++
++Deno.test("interpreter preserves standalone evaluation context", async () => {
++    const nonStrict = script(
++        "const exportedVars = { nFunction: () => String(this === globalThis) };",
++    );
++    const strict = script(
++        '"use strict"; const exportedVars = { nFunction: () => String(this === undefined) };',
++    );
++    assertEquals(await jsInterpreter(nonStrict, { n: "x" }), { n: "true" });
++    assertEquals(await jsInterpreter(strict, { n: "x" }), { n: "true" });
++});
++
++Deno.test("interpreter replaces its single cached script when the player source changes", async () => {
++    const originalFunction = globalThis.Function;
++    let compilations = 0;
++    globalThis.Function = new Proxy(originalFunction, {
++        construct(target, args) {
++            compilations++;
++            return Reflect.construct(target, args);
++        },
++    });
++    try {
++        const first = script(
++            "const exportedVars = { nFunction: () => 'first' };",
++        );
++        const second = script(
++            "const exportedVars = { nFunction: () => 'second' };",
++        );
++        assertEquals(await jsInterpreter(first, { n: "x" }), { n: "first" });
++        assertEquals(await jsInterpreter(second, { n: "x" }), { n: "second" });
++        assertEquals(await jsInterpreter(first, { n: "x" }), { n: "first" });
++        assertEquals(compilations, 3);
++    } finally {
++        globalThis.Function = originalFunction;
++    }
 +});
 diff --git a/src/tests/youtubeSessionRecovery_test.ts b/src/tests/youtubeSessionRecovery_test.ts
 new file mode 100644

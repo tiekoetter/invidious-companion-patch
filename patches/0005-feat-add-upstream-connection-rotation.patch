@@ -49,11 +49,15 @@ request-specific getNsigProcessorFn suffix using the library generator and
 existing parser, then compile only the stable source with runtime arguments.
 Test the actual Player.decipher API, n and signature results, changing
 processor inputs, bounded compilation reuse, and genuine extraction errors.
+
+Recognize the exact German temporary player message Video nicht verfügbar
+as a bounded session recovery candidate, while leaving private and geographic
+restriction messages unchanged. Add localized matcher and refresh tests.
 ---
  config/config.example.toml                   |  12 +
  src/lib/helpers/config.ts                    |  11 +
  src/lib/helpers/getFetchClient.ts            | 274 +++++++++--
- src/lib/helpers/jsInterpreter.ts             |  77 +++-
+ src/lib/helpers/jsInterpreter.ts             |  77 ++-
  src/lib/helpers/youtubePlayerHandling.ts     |  43 +-
  src/lib/helpers/youtubeSessionRecovery.ts    | 198 ++++++++
  src/lib/jobs/potoken.ts                      |  18 +-
@@ -64,10 +68,10 @@ processor inputs, bounded compilation reuse, and genuine extraction errors.
  src/routes/invidious_routes/latestVersion.ts |  12 +-
  src/routes/videoPlaybackProxy.ts             | 198 ++++++--
  src/routes/youtube_api_routes/player.ts      |   5 +-
- src/tests/connectionRotation_test.ts         | 612 +++++++++++++++++++++++++
+ src/tests/connectionRotation_test.ts         | 612 +++++++++++++++++++++++
  src/tests/jsInterpreter_test.ts              | 214 +++++++++
- src/tests/youtubeSessionRecovery_test.ts     | 654 +++++++++++++++++++++++++++
- 17 files changed, 2283 insertions(+), 154 deletions(-)
+ src/tests/youtubeSessionRecovery_test.ts     | 695 +++++++++++++++++++++++++++
+ 17 files changed, 2324 insertions(+), 154 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
 index 54579df..545f296 100644
@@ -644,7 +648,7 @@ index 3c6df51..af7e84b 100644
                      let index = 0;
 diff --git a/src/lib/helpers/youtubeSessionRecovery.ts b/src/lib/helpers/youtubeSessionRecovery.ts
 new file mode 100644
-index 0000000..cc41efe
+index 0000000..b3e0e27
 --- /dev/null
 +++ b/src/lib/helpers/youtubeSessionRecovery.ts
 @@ -0,0 +1,198 @@
@@ -710,7 +714,7 @@ index 0000000..cc41efe
 +    ]
 +        .some((value) =>
 +            typeof value === "string" &&
-+            /^this content (?:isn't|is not) available[,!.]? try again later[.!]?$/
++            /^(?:this content (?:isn't|is not) available[,!.]? try again later|video nicht verfügbar)[.!]?$/
 +                .test(
 +                    value.replace(/\u2019/g, "'").replace(/\s+/g, " ").trim()
 +                        .toLowerCase(),
@@ -2310,10 +2314,10 @@ index 0000000..e4a0d44
 +});
 diff --git a/src/tests/youtubeSessionRecovery_test.ts b/src/tests/youtubeSessionRecovery_test.ts
 new file mode 100644
-index 0000000..edcd41c
+index 0000000..5a362ab
 --- /dev/null
 +++ b/src/tests/youtubeSessionRecovery_test.ts
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,695 @@
 +import { assertEquals, assertRejects } from "./deps.ts";
 +import type { ApiResponse, Innertube } from "youtubei.js";
 +import { Hono } from "hono";
@@ -2365,6 +2369,8 @@ index 0000000..edcd41c
 +            "Video unavailable",
 +            "This video has been removed",
 +            "Not available in your country",
++            "Dieses Video ist privat",
++            "Video ist in deinem Land nicht verfügbar",
 +        ]
 +    ) {
 +        assertEquals(isTemporaryPlayerFailure(playerResponse(reason)), false);
@@ -2372,6 +2378,17 @@ index 0000000..edcd41c
 +    assertEquals(
 +        isTemporaryPlayerFailure(playerResponse(undefined, "LOGIN_REQUIRED")),
 +        false,
++    );
++});
++
++Deno.test("temporary player failure detection recognizes German unavailable response", () => {
++    assertEquals(
++        isTemporaryPlayerFailure(playerResponse("Video nicht verfügbar")),
++        true,
++    );
++    assertEquals(
++        isTemporaryPlayerFailure(playerResponse("VIDEO NICHT VERFÜGBAR.")),
++        true,
 +    );
 +});
 +
@@ -2425,6 +2442,34 @@ index 0000000..edcd41c
 +    assertEquals(seen, [previous, replacement]);
 +    assertEquals(rotations, 1);
 +    assertEquals(retirements, 1);
++});
++
++Deno.test("German temporary player response triggers bounded session recovery", async () => {
++    const previous = session("old");
++    const replacement = session("new");
++    let rotations = 0;
++    let generations = 0;
++    previous.rotate = () => rotations++;
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        return Promise.resolve(replacement);
++    }, { attempts: 2, timeoutMs: 1000 });
++    const response = await recovery.player((active) =>
++        Promise.resolve(
++            active === previous
++                ? playerResponse("Video nicht verfügbar")
++                : playerResponse("Video nicht verfügbar"),
++        )
++    );
++    assertEquals(rotations, 1);
++    assertEquals(generations, 1);
++    assertEquals(response.data.playabilityStatus?.status, "ERROR");
++    assertEquals(
++        response.data.playabilityStatus?.reason?.includes(
++            "Companion could not restore",
++        ),
++        true,
++    );
 +});
 +
 +Deno.test("concurrent player failures share a single refresh", async () => {

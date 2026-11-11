@@ -53,25 +53,32 @@ processor inputs, bounded compilation reuse, and genuine extraction errors.
 Recognize the exact German temporary player message Video nicht verfügbar
 as a bounded session recovery candidate, while leaving private and geographic
 restriction messages unchanged. Add localized matcher and refresh tests.
+
+Treat a successful player response with no usable playback formats as a bounded
+session recovery candidate. This covers stale session, PO-token, or upstream
+player-state failures that surface as missing-format decipher errors. Skip
+individual formats without a URL or cipher, and preserve explicit unavailable
+video responses. Add tests for fallback formats, signature ciphers, and refresh.
 ---
  config/config.example.toml                   |  12 +
  src/lib/helpers/config.ts                    |  11 +
- src/lib/helpers/getFetchClient.ts            | 274 +++++++++--
+ src/lib/helpers/getFetchClient.ts            | 274 +++++++--
  src/lib/helpers/jsInterpreter.ts             |  77 ++-
- src/lib/helpers/youtubePlayerHandling.ts     |  43 +-
- src/lib/helpers/youtubeSessionRecovery.ts    | 198 ++++++++
+ src/lib/helpers/youtubePlayerHandling.ts     |  47 +-
+ src/lib/helpers/youtubePlayerReq.ts          |  18 +-
+ src/lib/helpers/youtubeSessionRecovery.ts    | 203 +++++++
  src/lib/jobs/potoken.ts                      |  18 +-
  src/lib/types/HonoVariables.ts               |   2 +
- src/main.ts                                  |  86 ++--
+ src/main.ts                                  |  86 +--
  src/routes/invidious_routes/captions.ts      |   9 +-
  src/routes/invidious_routes/dashManifest.ts  |  12 +-
  src/routes/invidious_routes/latestVersion.ts |  12 +-
- src/routes/videoPlaybackProxy.ts             | 198 ++++++--
+ src/routes/videoPlaybackProxy.ts             | 198 +++++--
  src/routes/youtube_api_routes/player.ts      |   5 +-
- src/tests/connectionRotation_test.ts         | 612 +++++++++++++++++++++++
- src/tests/jsInterpreter_test.ts              | 214 +++++++++
- src/tests/youtubeSessionRecovery_test.ts     | 695 +++++++++++++++++++++++++++
- 17 files changed, 2324 insertions(+), 154 deletions(-)
+ src/tests/connectionRotation_test.ts         | 612 ++++++++++++++++++++
+ src/tests/jsInterpreter_test.ts              | 214 +++++++
+ src/tests/youtubeSessionRecovery_test.ts     | 799 +++++++++++++++++++++++++++
+ 18 files changed, 2454 insertions(+), 155 deletions(-)
 
 diff --git a/config/config.example.toml b/config/config.example.toml
 index 54579df..545f296 100644
@@ -557,7 +564,7 @@ index 524ac3c..d6db01b 100644
 +    return evaluate(input);
  };
 diff --git a/src/lib/helpers/youtubePlayerHandling.ts b/src/lib/helpers/youtubePlayerHandling.ts
-index 3c6df51..af7e84b 100644
+index 3c6df51..faeea7a 100644
 --- a/src/lib/helpers/youtubePlayerHandling.ts
 +++ b/src/lib/helpers/youtubePlayerHandling.ts
 @@ -18,6 +18,7 @@ const { youtubePlayerReq } = await import(youtubePlayerReqLocation);
@@ -646,12 +653,72 @@ index 3c6df51..af7e84b 100644
              ) {
                  for (
                      let index = 0;
+@@ -84,6 +99,8 @@ export const youtubePlayerParsing = async ({
+                 ) {
+                     const format = videoData.streamingData.formats[index];
+ 
++                    if (!format.url && !format.signatureCipher) continue;
++
+                     format.url = await streamingData.formats[index]
+                         .decipher(
+                             innertubeClient.session.player,
+@@ -105,6 +122,8 @@ export const youtubePlayerParsing = async ({
+                     const format =
+                         videoData.streamingData.adaptiveFormats[index];
+ 
++                    if (!format.url && !format.signatureCipher) continue;
++
+                     format.url = await streamingData.adaptive_formats[index]
+                         .decipher(
+                             innertubeClient.session.player,
+diff --git a/src/lib/helpers/youtubePlayerReq.ts b/src/lib/helpers/youtubePlayerReq.ts
+index fb782cc..f91f653 100644
+--- a/src/lib/helpers/youtubePlayerReq.ts
++++ b/src/lib/helpers/youtubePlayerReq.ts
+@@ -3,6 +3,7 @@ import NavigationEndpoint from "youtubei.js/NavigationEndpoint";
+ import type { TokenMinter } from "../jobs/potoken.ts";
+ 
+ import type { Config } from "./config.ts";
++import { RetryableYoutubeSessionError } from "./youtubeSessionRecovery.ts";
+ 
+ function callWatchEndpoint(
+     videoId: string,
+@@ -67,7 +68,7 @@ export const youtubePlayerReq = async (
+     if (
+         !innertubeClientOauthEnabled &&
+         youtubePlayerResponse.data.streamingData &&
+-        youtubePlayerResponse.data.streamingData.adaptiveFormats[0].url ===
++        youtubePlayerResponse.data.streamingData.adaptiveFormats[0]?.url ===
+             undefined
+     ) {
+         const innertubeClientsTypeFallback = [
+@@ -112,5 +113,20 @@ export const youtubePlayerReq = async (
+         }
+     }
+ 
++    const streamingData = youtubePlayerResponse.data.streamingData;
++    const formats = [
++        ...(streamingData?.formats ?? []),
++        ...(streamingData?.adaptiveFormats ?? []),
++    ];
++    if (
++        youtubePlayerResponse.data.playabilityStatus?.status !== "ERROR" &&
++        streamingData && formats.length > 0 &&
++        !formats.some((format) => format.url || format.signatureCipher)
++    ) {
++        throw new RetryableYoutubeSessionError(
++            "YouTube player response contained no usable playback formats",
++        );
++    }
++
+     return youtubePlayerResponse;
+ };
 diff --git a/src/lib/helpers/youtubeSessionRecovery.ts b/src/lib/helpers/youtubeSessionRecovery.ts
 new file mode 100644
-index 0000000..b3e0e27
+index 0000000..ca0ad1f
 --- /dev/null
 +++ b/src/lib/helpers/youtubeSessionRecovery.ts
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,203 @@
 +import { abortable } from "@std/async";
 +import type { ApiResponse, Innertube } from "youtubei.js";
 +import { z } from "zod";
@@ -664,6 +731,8 @@ index 0000000..b3e0e27
 +    rotate?: () => void;
 +    retire?: () => void;
 +};
++
++export class RetryableYoutubeSessionError extends Error {}
 +
 +const TextSchema = z.object({
 +    simpleText: z.string().optional(),
@@ -809,7 +878,10 @@ index 0000000..b3e0e27
 +                    : await pending;
 +            } catch (err) {
 +                callerSignal?.throwIfAborted();
-+                if (!(err instanceof UpstreamPoolRotationError)) throw err;
++                if (
++                    !(err instanceof UpstreamPoolRotationError) &&
++                    !(err instanceof RetryableYoutubeSessionError)
++                ) throw err;
 +            }
 +        }
 +        if (response && !isTemporaryPlayerFailure(response)) return response;
@@ -2314,10 +2386,10 @@ index 0000000..e4a0d44
 +});
 diff --git a/src/tests/youtubeSessionRecovery_test.ts b/src/tests/youtubeSessionRecovery_test.ts
 new file mode 100644
-index 0000000..5a362ab
+index 0000000..90cf7d5
 --- /dev/null
 +++ b/src/tests/youtubeSessionRecovery_test.ts
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,799 @@
 +import { assertEquals, assertRejects } from "./deps.ts";
 +import type { ApiResponse, Innertube } from "youtubei.js";
 +import { Hono } from "hono";
@@ -2333,9 +2405,11 @@ index 0000000..5a362ab
 +import captions from "../routes/invidious_routes/captions.ts";
 +import {
 +    isTemporaryPlayerFailure,
++    RetryableYoutubeSessionError,
 +    type YoutubeSession,
 +    YoutubeSessionRecovery,
 +} from "../lib/helpers/youtubeSessionRecovery.ts";
++import { youtubePlayerReq } from "../lib/helpers/youtubePlayerReq.ts";
 +
 +function session(name: string): YoutubeSession {
 +    return { innertubeClient: { name } as unknown as Innertube };
@@ -2469,6 +2543,108 @@ index 0000000..5a362ab
 +            "Companion could not restore",
 +        ),
 +        true,
++    );
++});
++
++Deno.test("no usable formats triggers one bounded session refresh and retry", async () => {
++    const previous = session("old");
++    const replacement = session("new");
++    let generations = 0;
++    let requests = 0;
++    previous.rotate = () => {};
++    const recovery = new YoutubeSessionRecovery(previous, () => {
++        generations++;
++        return Promise.resolve(replacement);
++    }, { attempts: 2, timeoutMs: 1000 });
++    const response = await recovery.player(() => {
++        requests++;
++        if (requests === 1) {
++            return Promise.reject(
++                new RetryableYoutubeSessionError(
++                    "No usable playback formats",
++                ),
++            );
++        }
++        return Promise.resolve(playerResponse("", "OK"));
++    });
++    assertEquals(generations, 1);
++    assertEquals(requests, 2);
++    assertEquals(response.data.playabilityStatus?.status, "OK");
++});
++
++Deno.test("player request marks empty formats as retryable but preserves unavailable-video errors", async () => {
++    const config = ConfigSchema.parse({
++        server: { secret_key: "testSecretKey123" },
++    });
++    const makeClient = (responses: ApiResponse[]) => ({
++        session: { player: { signature_timestamp: 1 } },
++        actions: {
++            execute: () => Promise.resolve(responses.shift()!),
++        },
++    } as unknown as Innertube);
++    const noFormats = (): ApiResponse => ({
++        success: true,
++        status_code: 200,
++        data: {
++            playabilityStatus: { status: "OK" },
++            streamingData: {
++                expiresInSeconds: "21540",
++                adaptiveFormats: [{ itag: 18 }],
++                formats: [],
++            },
++        },
++    });
++    const tokenMinter = () => Promise.resolve("content-token");
++
++    const responses = [noFormats(), noFormats(), noFormats(), noFormats()];
++    await assertRejects(
++        () =>
++            youtubePlayerReq(
++                makeClient(responses),
++                "abcdefghijk",
++                config,
++                tokenMinter,
++            ),
++        RetryableYoutubeSessionError,
++        "no usable playback formats",
++    );
++
++    const signatureCipherResponse = noFormats();
++    signatureCipherResponse.data.streamingData!.adaptiveFormats[0]
++        .signatureCipher = "url=https%3A%2F%2Fexample.com%2Fvideo";
++    const fallbackResponses = [
++        noFormats(),
++        noFormats(),
++        noFormats(),
++        noFormats(),
++    ];
++    fallbackResponses[1] = signatureCipherResponse;
++    const result = await youtubePlayerReq(
++        makeClient(fallbackResponses),
++        "abcdefghijk",
++        config,
++        tokenMinter,
++    );
++    assertEquals(
++        result.data.streamingData?.adaptiveFormats[0].signatureCipher,
++        "url=https%3A%2F%2Fexample.com%2Fvideo",
++    );
++
++    const unavailable = {
++        success: true,
++        status_code: 200,
++        data: {
++            playabilityStatus: { status: "ERROR", reason: "Video unavailable" },
++        },
++    } as ApiResponse;
++    assertEquals(
++        await youtubePlayerReq(
++            makeClient([unavailable]),
++            "abcdefghijk",
++            config,
++            tokenMinter,
++        ),
++        unavailable,
 +    );
 +});
 +

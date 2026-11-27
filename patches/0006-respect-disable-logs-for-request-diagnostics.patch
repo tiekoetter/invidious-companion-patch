@@ -1,0 +1,194 @@
+From a2a40c601d5fb828a803f732f4b2fd9a2337d6ae Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?L=C3=A9on=20Tiek=C3=B6tter?= <leon@tiekoetter.com>
+Date: Fri, 27 Nov 2026 22:23:17 +0100
+Subject: [PATCH] Respect disable_logs for request diagnostics
+
+server.disable_logs only replaced the request logger, so upstream playback
+error messages and the fallback warning that names the requested video
+were still written to the log. Skip them when logs are disabled.
+
+Recovery warnings carry no request data and are unchanged.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ config/config.example.toml               |  2 +
+ src/lib/helpers/youtubePlayerReq.ts      |  2 +-
+ src/routes/videoPlaybackProxy.ts         |  7 ++--
+ src/tests/connectionRotation_test.ts     | 37 +++++++++++++++++++
+ src/tests/youtubeSessionRecovery_test.ts | 47 ++++++++++++++++++++++++
+ 5 files changed, 91 insertions(+), 4 deletions(-)
+
+diff --git a/config/config.example.toml b/config/config.example.toml
+index eefe72e..7b79970 100644
+--- a/config/config.example.toml
++++ b/config/config.example.toml
+@@ -23,6 +23,8 @@
+ # encrypt_query_params = false # env variable: SERVER_ENCRYPT_QUERY_PARAMS
+ # enable_metrics = false # env variable: SERVER_ENABLE_METRICS
+ # max_dash_resolution = 1080
++# # Disables the request log, upstream playback error messages, and the warning
++# # that names a video when no fallback client returns usable formats.
+ # disable_logs = false # env variable: SERVER_DISABLE_LOGS
+ # # Query parameters to encrypt
+ # # pot: potoken
+diff --git a/src/lib/helpers/youtubePlayerReq.ts b/src/lib/helpers/youtubePlayerReq.ts
+index f91f653..dc3ff35 100644
+--- a/src/lib/helpers/youtubePlayerReq.ts
++++ b/src/lib/helpers/youtubePlayerReq.ts
+@@ -106,7 +106,7 @@ export const youtubePlayerReq = async (
+                 break;
+             }
+         }
+-        if (!fallbackSucceeded) {
++        if (!fallbackSucceeded && !config.server.disable_logs) {
+             console.warn(
+                 `[WARNING] No fallback YT client supplied usable adaptive formats for video: ${videoId}`,
+             );
+diff --git a/src/routes/videoPlaybackProxy.ts b/src/routes/videoPlaybackProxy.ts
+index 0d96a90..ec7e8a7 100644
+--- a/src/routes/videoPlaybackProxy.ts
++++ b/src/routes/videoPlaybackProxy.ts
+@@ -146,6 +146,7 @@ videoPlaybackProxy.get("/", async (c) => {
+         });
+ 
+     const maxRetries = config.networking.connection_recovery_attempts;
++    const logFailures = !config.server.disable_logs;
+     const playbackController = new AbortController();
+     const playbackSignal = AbortSignal.any([
+         c.req.raw.signal,
+@@ -204,7 +205,7 @@ videoPlaybackProxy.get("/", async (c) => {
+             googlevideoResponse = await fetchHead(location);
+         } catch (err) {
+             // The client going away is not an error: don't log it.
+-            if (!playbackSignal.aborted) {
++            if (logFailures && !playbackSignal.aborted) {
+                 console.error("[ERROR] googlevideo HEAD request failed:", err);
+             }
+             return upstreamError(502, "googlevideo HEAD request failed");
+@@ -363,7 +364,7 @@ videoPlaybackProxy.get("/", async (c) => {
+     try {
+         firstChunk = await chunks.next();
+     } catch (err) {
+-        if (!playbackSignal.aborted) {
++        if (logFailures && !playbackSignal.aborted) {
+             console.error("[ERROR] googlevideo POST request failed:", err);
+         }
+         return upstreamError(502, "googlevideo POST request failed");
+@@ -388,7 +389,7 @@ videoPlaybackProxy.get("/", async (c) => {
+             } catch (err) {
+                 // The client cancelling the response (e.g. the player switching
+                 // quality) is not an error: don't log it.
+-                if (!playbackSignal.aborted) {
++                if (logFailures && !playbackSignal.aborted) {
+                     console.error(
+                         "[ERROR] googlevideo chunk streaming failed:",
+                         err,
+diff --git a/src/tests/connectionRotation_test.ts b/src/tests/connectionRotation_test.ts
+index 1e59b52..fb7e007 100644
+--- a/src/tests/connectionRotation_test.ts
++++ b/src/tests/connectionRotation_test.ts
+@@ -549,6 +549,43 @@ Deno.test("playback reports exhausted pre-header connection failures as 502", as
+     });
+ });
+ 
++Deno.test("disable_logs silences upstream playback errors", async () => {
++    const originalError = console.error;
++    const logged: unknown[] = [];
++    console.error = (message) => logged.push(message);
++    try {
++        for (const failingMethod of ["HEAD", "POST"]) {
++            for (const disableLogs of [false, true]) {
++                await withNetworkMock((_input, init) => {
++                    if (init?.method === failingMethod) {
++                        return Promise.resolve(
++                            new Response(null, { status: 404 }),
++                        );
++                    }
++                    return Promise.resolve(
++                        new Response(null, {
++                            headers: { "content-length": "4" },
++                        }),
++                    );
++                }, async () => {
++                    const config = recoveryConfig(0);
++                    config.server.disable_logs = disableLogs;
++                    const response = await requestPlayback(config);
++                    assertEquals(
++                        response.status,
++                        failingMethod === "HEAD" ? 404 : 502,
++                    );
++                    await response.body?.cancel();
++                });
++            }
++        }
++    } finally {
++        console.error = originalError;
++    }
++    // A HEAD status is relayed without a message, so only the POST logs.
++    assertEquals(logged, ["[ERROR] googlevideo POST request failed:"]);
++});
++
+ Deno.test("playback rejects mismatched ranges without forwarding corrupt data", async () => {
+     let posts = 0;
+     await withNetworkMock((_input, init) => {
+diff --git a/src/tests/youtubeSessionRecovery_test.ts b/src/tests/youtubeSessionRecovery_test.ts
+index 90cf7d5..539b6dc 100644
+--- a/src/tests/youtubeSessionRecovery_test.ts
++++ b/src/tests/youtubeSessionRecovery_test.ts
+@@ -256,6 +256,53 @@ Deno.test("player request marks empty formats as retryable but preserves unavail
+     );
+ });
+ 
++Deno.test("disable_logs silences the fallback warning that names the video", async () => {
++    const noFormats = (): ApiResponse => ({
++        success: true,
++        status_code: 200,
++        data: {
++            playabilityStatus: { status: "OK" },
++            streamingData: {
++                expiresInSeconds: "21540",
++                adaptiveFormats: [{ itag: 18 }],
++                formats: [],
++            },
++        },
++    });
++    const originalWarn = console.warn;
++    const warnings: unknown[] = [];
++    console.warn = (message) => warnings.push(message);
++    try {
++        for (const disableLogs of [false, true]) {
++            await assertRejects(
++                () =>
++                    youtubePlayerReq(
++                        {
++                            session: { player: { signature_timestamp: 1 } },
++                            actions: {
++                                execute: () => Promise.resolve(noFormats()),
++                            },
++                        } as unknown as Innertube,
++                        "abcdefghijk",
++                        ConfigSchema.parse({
++                            server: {
++                                secret_key: "testSecretKey123",
++                                disable_logs: disableLogs,
++                            },
++                        }),
++                        () => Promise.resolve("content-token"),
++                    ),
++                RetryableYoutubeSessionError,
++            );
++        }
++    } finally {
++        console.warn = originalWarn;
++    }
++    assertEquals(warnings, [
++        "[WARNING] No fallback YT client supplied usable adaptive formats for video: abcdefghijk",
++    ]);
++});
++
+ Deno.test("concurrent player failures share a single refresh", async () => {
+     const previous = session("old");
+     const replacement = session("new");
+-- 
+2.56.1
+

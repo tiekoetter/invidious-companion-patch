@@ -11,6 +11,12 @@ on:
       - 'LICENSE'
       - 'README.md'
       - 'docker-compose.yml'
+  pull_request:
+    paths-ignore:
+      - '.gitignore'
+      - 'LICENSE'
+      - 'README.md'
+      - 'docker-compose.yml'
   workflow_dispatch:
 
 env:
@@ -22,7 +28,30 @@ permissions:
   packages: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - name: Patch invidious-companion
+        run: |
+          cd ./invidious-companion
+          git config --global user.email "you@example.com"
+          git config --global user.name "Your Name"
+          git am ../patches/*.patch
+
+      - name: Verify patched invidious-companion
+        uses: ./.github/actions/verify-companion
+
   build-and-push:
+    needs: verify
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:

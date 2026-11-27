@@ -1,0 +1,39 @@
+name: Verify patched invidious-companion
+description: >-
+  Type-check, lint and run the offline tests of an invidious-companion
+  checkout that already has the patches applied.
+
+runs:
+  using: composite
+  steps:
+    - name: Read the Deno version used to build the image
+      id: deno
+      shell: bash
+      working-directory: invidious-companion
+      run: |
+        version="$(sed -n 's|^FROM denoland/deno:bin-\([0-9.]*\).*|\1|p' Dockerfile | head -n 1)"
+        echo "version=${version:-2.x}" >> "${GITHUB_OUTPUT}"
+
+    - name: Set up Deno
+      uses: denoland/setup-deno@v2
+      with:
+        deno-version: ${{ steps.deno.outputs.version }}
+
+    - name: Type-check
+      shell: bash
+      working-directory: invidious-companion
+      run: deno task check
+
+    - name: Lint
+      shell: bash
+      working-directory: invidious-companion
+      run: deno task lint
+
+    - name: Run offline tests
+      shell: bash
+      working-directory: invidious-companion
+      run: |
+        # main_test.ts needs a live YouTube session, which CI runners rarely get.
+        find src/tests -name '*_test.ts' ! -name 'main_test.ts' -print0 |
+          sort -z |
+          xargs -0 deno task test

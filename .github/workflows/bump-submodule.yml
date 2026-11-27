@@ -48,8 +48,6 @@ jobs:
         if: steps.update.outputs.changed == 'true'
         shell: bash
         run: |
-          after="${{ steps.update.outputs.after }}"
-
           git -C invidious-companion config user.email "github-actions[bot]@users.noreply.github.com"
           git -C invidious-companion config user.name "github-actions[bot]"
 
@@ -62,8 +60,21 @@ jobs:
             git -C invidious-companion am --abort 2>/dev/null || true
           fi
 
-          git -C invidious-companion reset --hard "${after}"
           echo "patches_apply=${patches_apply}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify patched invidious-companion
+        id: checks
+        if: steps.verify.outputs.patches_apply == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/verify-companion
+
+      - name: Restore the bumped submodule checkout
+        if: steps.update.outputs.changed == 'true'
+        shell: bash
+        env:
+          AFTER: ${{ steps.update.outputs.after }}
+        run: |
+          git -C invidious-companion reset --hard "${AFTER}"
 
       - name: Create bump pull request
         id: cpr
@@ -82,10 +93,11 @@ jobs:
             - Previous submodule commit: `${{ steps.update.outputs.before }}`
             - New submodule commit: `${{ steps.update.outputs.after }}`
             - Patch application check: `${{ steps.verify.outputs.patches_apply }}`
+            - Patch verification (type-check, lint, offline tests): `${{ steps.checks.outcome || 'skipped' }}`
 
-            The patch application check replays `patches/*.patch` onto the bumped submodule commit and is separate from whether this PR has merge conflicts with the base branch.
+            The patch application check replays `patches/*.patch` onto the bumped submodule commit and is separate from whether this PR has merge conflicts with the base branch. The patch verification then checks the patched result and is skipped when the patches do not apply.
 
-            If the patch application check is `false`, the submodule pointer was still updated here so the patch conflict can be fixed in this PR.
+            If the patch application check is `false` or the patch verification is `failure`, the submodule pointer was still updated here so the patches can be fixed in this PR.
           add-paths: |
             invidious-companion
 
@@ -96,6 +108,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.cpr.outputs.pull-request-head-sha }}
           PATCHES_APPLY: ${{ steps.verify.outputs.patches_apply }}
+          CHECKS_OUTCOME: ${{ steps.checks.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [[ "${PATCHES_APPLY}" == "true" ]]; then
@@ -114,9 +127,34 @@ jobs:
             -f "description=${description}" \
             -f "target_url=${RUN_URL}"
 
+          if [[ "${CHECKS_OUTCOME}" == "success" ]]; then
+            state=success
+            description="Type-check, lint and offline tests pass with the patches"
+          elif [[ "${CHECKS_OUTCOME}" == "failure" ]]; then
+            state=failure
+            description="Type-check, lint or offline tests fail with the patches"
+          else
+            exit 0
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f "state=${state}" \
+            -f "context=Patch verification" \
+            -f "description=${description}" \
+            -f "target_url=${RUN_URL}"
+
       - name: Fail when patches need attention
         if: steps.verify.outputs.patches_apply == 'false'
         shell: bash
         run: |
           echo "::error::The bump PR is mergeable, but one or more patches did not apply to the bumped invidious-companion checkout. See the 'Verify patches still apply' step for the git-am output."
+          exit 1
+
+      - name: Fail when the patched checkout does not verify
+        if: steps.checks.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::error::The patches apply to the bumped invidious-companion checkout, but type-check, lint or the offline tests failed. See the 'Verify patched invidious-companion' step."
           exit 1
